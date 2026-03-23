@@ -11,6 +11,8 @@ try:
     from lineage_plugin import LineagePlugin
     from glossary_plugin import GlossaryPlugin
     from policy_tag_plugin import PolicyTagPlugin
+    from dq_plugin import DQPlugin
+    from dq_propagation import DQPropagationEngine
 except ImportError as e:
     print(f"Error: Could not import Plugins. {e}")
     sys.exit(1)
@@ -47,6 +49,11 @@ def main():
     policy_propagate_parser.add_argument("--apply", action="store_true", help="Apply recommendations directly without confirmation")
     policy_propagate_parser.add_argument("--propagate-access", action="store_true", help="Also propagate Fine-Grained Access Control (IAM) from source tags")
     policy_propagate_parser.add_argument("--readers", help="Comma-separated list of additional readers to add to the policy tags")
+    
+    # DQ Propagate command
+    dq_propagate_parser = subparsers.add_parser("dq-propagate", help="Analyze and propagate trust/DQ scores for a table or view")
+    dq_propagate_parser.add_argument("--dataset", "--dataset_id", dest="dataset", required=True, help="BigQuery Dataset ID")
+    dq_propagate_parser.add_argument("--table", "--table_id", dest="table", required=True, help="BigQuery Table or View ID")
     
     args = parser.parse_args()
     
@@ -106,7 +113,7 @@ def main():
             print("\nGlossary Term Recommendations:")
             print(df[["Column", "Suggested Term", "Confidence", "Rationale"]].to_string(index=False))
             print("\nNote: Use the UI or a separate apply command to persist these mappings.")
-
+ 
     elif args.command == "policy-scan":
         print(f"Scanning dataset '{args.dataset}' for existing policy tags...")
         df = policy_plugin.scan_for_policy_tags(args.dataset)
@@ -115,7 +122,7 @@ def main():
         else:
             print("\nExisting Policy Tags:")
             print(df.to_string(index=False))
-
+ 
     elif args.command == "policy-propagate":
         print(f"Analyzing policy tag propagation for '{args.dataset}.{args.table}'...")
         df = policy_plugin.preview_policy_tag_propagation(args.dataset, args.table)
@@ -158,8 +165,77 @@ def main():
                 print("Successfully updated policy tags and access in BigQuery.")
             else:
                 print("Operation cancelled.")
+    
+    elif args.command == "dq-propagate":
+        from dq_propagation import DQPropagationEngine
+        from dq_plugin import DQPlugin
+        
+        print(f"Analyzing Trust & Quality for '{args.dataset}.{args.table}' (Multi-hop Lineage)...")
+        dq_plugin = DQPlugin(args.project, args.location)
+        engine = DQPropagationEngine(args.project, args.location)
+        
+        target_fqn = f"bigquery:{args.project}.{args.dataset}.{args.table}"
+        
+        # We need to list columns to analyze
+        from google.cloud import bigquery
+        from context import get_credentials
+        client = bigquery.Client(project=args.project, credentials=get_credentials(args.project))
+        table = client.get_table(f"{args.project}.{args.dataset}.{args.table}")
+        columns = [f.name for f in table.schema]
+        
+        # 1. Perform multi-hop propagation analysis
+        propagation_data = engine.propagate_dq_scores(target_fqn, args.dataset, args.table, columns)
+        
+        results = []
+        for col in columns:
+            data = propagation_data.get(col, {})
+            leaves = data.get("leaves", [])
+            bonus = data.get("bonus", 0.0)
+            
+            upstream_scores = []
+            source_names = []
+            for leaf in leaves:
+                src_parts = leaf['source_entity'].split('.')
+                if len(src_parts) == 3:
+                    s_ds, s_tab = src_parts[1], src_parts[2]
+                    # Fetch granular score for specific upstream column
+                    s_summary = dq_plugin.fetch_dq_summary(s_ds, s_tab, leaf.get('source_column'))
+                    upstream_scores.append(s_summary['score'])
+                    source_names.append(f"{s_tab}.{leaf.get('source_column')}")
+            
+            if not upstream_scores:
+                # Fallback to direct table scan if no lineage found
+                summary = dq_plugin.fetch_dq_summary(args.dataset, args.table, col)
+                base_score = summary['score']
+                source_type = summary['source']
+            else:
+                base_score = engine.aggregate_scores(upstream_scores)
+                source_type = "DERIVED"
+            
+            final_score = min(base_score + bonus, 1.0)
+            
+            # 2. Persist to history (JSON & BQ)
+            engine.update_history(target_fqn, col, final_score, source_type=source_type)
+            trend = engine.get_trend(target_fqn, col)
+            
+            badge = "🟢 High" if final_score > 0.9 else ("🟡 Medium" if final_score > 0.7 else "🔴 Low")
+            
+            results.append({
+                "Column": col,
+                "Trust": round(final_score, 2),
+                "Badge": badge,
+                "Trend": trend.capitalize(),
+                "Source Path": ", ".join(source_names[:2]) + ("..." if len(source_names) > 2 else ""),
+                "Bonus": f"+{int(bonus*100)}%" if bonus > 0 else "0%"
+            })
+            
+        df = pd.DataFrame(results)
+        print("\nColumn Trust Metrics (Calculated from Upstream Leaves):")
+        print(df.to_string(index=False))
+        print("\nNote: Trust history for these columns has been updated and persisted to BigQuery.")
 
     else:
+
         parser.print_help()
 
 if __name__ == "__main__":

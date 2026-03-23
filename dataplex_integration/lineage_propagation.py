@@ -119,14 +119,22 @@ class TransformationEnricher:
         sql_clean = re.sub(r'\s+', ' ', sql_clean).strip()
         
         # Look for SELECT ... AS target_col or SELECT target_col AS ...
-        # Use word boundaries \b to ensure exact matches only (e.g. 'amount' vs 'amount_discounted')
-        pattern = rf"([^,]*?)\s+as\s+`?\b{target_col}\b`?"
-        match = re.search(pattern, sql_clean, re.IGNORECASE)
+        # New pattern: ALSO match 'SELECT ... {target_col},' or 'SELECT ... {target_col} FROM' handles passthrough
+        pattern_as = rf"([^,]*?)\s+as\s+`?\b{target_col}\b`?"
+        match = re.search(pattern_as, sql_clean, re.IGNORECASE)
         
+        if not match:
+            # Fallback for simple passthrough (no AS): SELECT col, or SELECT ... , col, or SELECT col FROM
+            pattern_passthrough = rf"(\b{target_col}\b)(?:,|$|\s+FROM)"
+            match = re.search(pattern_passthrough, sql_clean, re.IGNORECASE)
+            
         if match:
             expr = match.group(1).strip()
-            # Clean up leading SELECT if present, and anything before it (like CREATE TABLE ... AS)
-            # Find the last 'SELECT' in the expression if it exists
+            # If it's a passthrough, we need the whole SELECT part if there's a DISTINCT
+            if "DISTINCT " in sql_clean.upper() and expr == target_col:
+                expr = f"DISTINCT {expr}"
+            
+            # Clean up leading SELECT if present
             last_select = re.split(r'\bSELECT\b', expr, flags=re.IGNORECASE)[-1]
             return last_select.strip()
         

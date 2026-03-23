@@ -34,6 +34,8 @@ from lineage_plugin import LineagePlugin
 from glossary_plugin import GlossaryPlugin
 from policy_tag_plugin import PolicyTagPlugin
 from context import set_oauth_token
+from dq_plugin import DQPlugin
+from dq_propagation import DQPropagationEngine
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO)
@@ -42,7 +44,8 @@ logger = logging.getLogger(__name__)
 # Fetch Project ID from environment or default
 DEFAULT_PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT", "governance-agent")
 DEFAULT_LOCATION = "europe-west1"
-DEFAULT_DATASET_ID = "retail_syn_data"
+DEFAULT_DATASET_ID = os.environ.get("BIGQUERY_DATASET_ID", "retail_syn_data")
+DEFAULT_GOVERNANCE_DATASET_ID = os.environ.get("GOVERNANCE_DATASET_ID", "governance_results")
 
 KNOWLEDGE_JSON_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "../dataplex_integration/dataset_insights_sample.json"))
 
@@ -234,6 +237,76 @@ def apply_propagation_improved(project_id, location, dataset_id, target_table, c
     except Exception as e:
         logger.error(f"Apply failed: {e}")
         raise gr.Error(f"Apply failed: {str(e)}")
+
+def get_dq_propagation(project_id, location, dataset_id, table_id, request: gr.Request = None):
+    token = get_token_from_session(request)
+    set_oauth_token(token)
+    try:
+        dq_plugin = DQPlugin(project_id, location)
+        engine = DQPropagationEngine(project_id, location, token=token)
+        
+        # 1. Get DQ summary for target
+        target_fqn = f"bigquery:{project_id}.{dataset_id}.{table_id}"
+        
+        # We need to list columns to analyze
+        from google.cloud import bigquery
+        from context import get_credentials
+        client = bigquery.Client(project=project_id, credentials=get_credentials(project_id))
+        table = client.get_table(f"{project_id}.{dataset_id}.{table_id}")
+        columns = [f.name for f in table.schema]
+        
+        # 2. Perform multi-hop propagation analysis
+        propagation_data = engine.propagate_dq_scores(target_fqn, dataset_id, table_id, columns)
+        
+        results = []
+        for col in columns:
+            data = propagation_data.get(col, {})
+            leaves = data.get("leaves", [])
+            bonus = data.get("bonus", 0.0)
+            
+            upstream_scores = []
+            source_names = []
+            for leaf in leaves:
+                src_parts = leaf['source_entity'].split('.')
+                if len(src_parts) == 3:
+                    s_ds, s_tab = src_parts[1], src_parts[2]
+                    # Fetch granular score for specific upstream column
+                    s_summary = dq_plugin.fetch_dq_summary(s_ds, s_tab, leaf.get('source_column'))
+                    upstream_scores.append(s_summary['score'])
+                    source_names.append(f"{s_tab}.{leaf.get('source_column')}")
+            
+            if not upstream_scores:
+                # Fallback to direct table scan if no lineage found
+                summary = dq_plugin.fetch_dq_summary(dataset_id, table_id, col)
+                base_score = summary['score']
+                source_type = summary['source']
+            else:
+                base_score = engine.aggregate_scores(upstream_scores)
+                source_type = "DERIVED"
+            
+            final_score = min(base_score + bonus, 1.0)
+            
+            # 3. Persist to history (JSON & BQ)
+            engine.update_history(target_fqn, col, final_score, source_type=source_type)
+            trend = engine.get_trend(target_fqn, col)
+            
+            # Determine Badge
+            badge = "🟢 High" if final_score > 0.9 else ("🟡 Medium" if final_score > 0.7 else "🔴 Low")
+            
+            results.append({
+                "Column": col,
+                "Trust Score": round(final_score, 2),
+                "Badge": badge,
+                "Trend": trend.capitalize(),
+                "Bonus (Remediation)": f"+{int(bonus*100)}%" if bonus > 0 else "None",
+                "Upstream Sources": ", ".join(source_names[:2]) + ("..." if len(source_names) > 2 else "") or "None (Source)"
+            })
+            
+        return pd.DataFrame(results)
+    except Exception as e:
+        logger.error(f"DQ propagation failed: {e}")
+        raise gr.Error(f"Operation failed: {str(e)}")
+
 
 def apply_glossary_selections(project_id, location, dataset_id, table_id, reco_df, request: gr.Request = None):
     token = get_token_from_session(request)
@@ -712,6 +785,32 @@ with gr.Blocks(title="Dataplex Data Steward") as demo:
                 apply_policy_tag_recommendations,
                 inputs=[config_project, config_location, global_dataset, policy_table, policy_recommendations_view, additional_readers_txt],
                 outputs=policy_apply_result
+            )
+
+        with gr.TabItem("Trust Center (DQ)"):
+            with gr.Column(elem_classes=["gcp-card"]):
+                gr.Markdown("## 💎 Data Trust & Quality Propagation")
+                gr.Markdown("Visualizes derived trust scores for tables and views based on upstream quality and transformation logic.")
+                
+                with gr.Row():
+                    dq_table = gr.Textbox(label="Target Table/View", value="transactions")
+                
+                dq_analyze_btn = gr.Button("Analyze Trust & Quality", variant="primary", elem_classes=["gr-button-primary"])
+            
+            with gr.Column(elem_classes=["gcp-card"]):
+                dq_results_view = gr.Dataframe(
+                    label="Column Trust Metrics",
+                    interactive=False,
+                    wrap=True
+                )
+                
+                gr.Markdown("### 💡 Trust Logic")
+                gr.Markdown("- **Conservative Scoring**: Minimum quality of all upstream contributors.\n- **Remediation Bonus**: Automatic detection of `DISTINCT` or `COALESCE` improves the derived score.\n- **Trend Analysis**: Compares current score against the last 5 snapshots.")
+
+            dq_analyze_btn.click(
+                get_dq_propagation,
+                inputs=[config_project, config_location, global_dataset, dq_table],
+                outputs=dq_results_view
             )
 
     # Auth logic: Show info on load if already logged in

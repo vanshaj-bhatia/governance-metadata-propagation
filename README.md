@@ -14,6 +14,9 @@ This project demonstrates an agentic data governance solution using Google Cloud
 *   **Native Dataplex Integration**: Persists glossary mappings as native `EntryLinks` visible in the Dataplex Schema tab.
 *   **Unified UI & CLI**: Manage governance tasks via a Gradio-based web app or a headless CLI.
 *   **Policy Tag Propagation**: Recommends and applies BigQuery policy tags via lineage, with support for "straight pull" detection and an integrated **Access Summary** (Readers & Data Policies).
+*   **Data Trust Center (DQ)**: Derived trust scores for views and tables based on upstream Dataplex DQ/Profiling results and multi-hop lineage.
+*   **Remediation Detection**: Automatically detects SQL transformations (e.g. `COALESCE`, `DISTINCT`) that improve data quality and applies "Trust Bonuses".
+*   **Trust History Persistence**: Tracks 0.0-1.0 trust scores over time in BigQuery and local history for trend analysis.
 *   **CLL API Preview allowlisting required**: Please contact your Google Cloud account team to get access to CLL API
 
 ---
@@ -53,6 +56,7 @@ python3 ui/gradio_app.py
 - **Dashboard**: Run "Scan Dataset" to see health metrics.
 - **Description Propagation**: Enter a table name to preview and apply lineage-based descriptions.
 - **Policy Tag Propagation**: Propagate sensitive data tags across the lineage chain with automated transformation assessment.
+- **Trust Center (DQ)**: Analyze derived trust scores for a view or table, showing upstream quality sources and remediation bonuses.
 - **Settings**: Toggle OAuth/ADC modes for specific user actions.
 
 ### 3. 🐳 Deployment (Docker & Cloud Run)
@@ -95,6 +99,9 @@ python3 steward_cli.py policy-scan --dataset retail_syn_data
 
 # Preview and apply policy tag propagation to a table
 python3 steward_cli.py policy-propagate --dataset retail_syn_data --table transactions --apply
+
+# Analyze and propagate trust/DQ scores for a view or table
+python3 steward_cli.py dq-propagate --dataset retail_syn_data --table customers
 ```
 
 ### 3. Data Integration Scripts
@@ -114,6 +121,8 @@ python3 steward_cli.py policy-propagate --dataset retail_syn_data --table transa
 | **Lineage Plugin** | `agent/plugins/lineage_plugin.py` | Orchestrates description propagation via Lineage API. |
 | **Policy Tag Plugin** | `agent/plugins/policy_tag_plugin.py` | Recommends and applies Policy Tags based on lineage and SQL analysis. |
 | **Similarity Engine** | `agent/plugins/similarity_engine.py` | AI logic for scoring lexical and semantic matches. |
+| **DQ Plugin** | `agent/plugins/dq_plugin.py` | Interfaces with Dataplex DQ/Profiling result jobs with BQ fallbacks. |
+| **DQ Propagation** | `dataplex_integration/dq_propagation.py` | Recursive DQ scoring and remediation detection logic. |
 | **Traverser** | `dataplex_integration/lineage_propagation.py` | Low-level Graph API logic for traversing dependencies. |
 | **Enricher** | `dataplex_integration/lineage_propagation.py` | Context-aware SQL transformation analyzer. |
 
