@@ -14,7 +14,7 @@ from google.oauth2.credentials import Credentials
 from google.cloud import bigquery
 from context import get_oauth_token, get_credentials
 from lineage_propagation import LineageGraphTraverser, TransformationEnricher, SQLFetcher
-from dataset_insights import DescriptionPropagator
+from insights_connector import DataInsightsClient as DescriptionPropagator
 
 logger = logging.getLogger(__name__)
 

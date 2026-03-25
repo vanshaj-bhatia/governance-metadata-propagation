@@ -5,7 +5,7 @@ from google.cloud.dataplex_v1 import DataScanServiceClient
 from google.api_core import exceptions
 
 # Load configurations from .env
-load_dotenv()
+load_dotenv(override=True)
 
 PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT")
 LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "europe-west1")

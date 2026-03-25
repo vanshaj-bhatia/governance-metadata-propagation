@@ -236,10 +236,10 @@ class LineageGraphTraverser:
         try:
             with open(json_path, 'r') as f:
                 data = json.load(f)
-                # Navigate to schemaRelationships
-                # data -> datasetResult -> schemaRelationships
-                self.knowledge_insights = data.get("datasetResult", {}).get("schemaRelationships", [])
-                logger.info(f"Loaded {len(self.knowledge_insights)} schema relationships from {json_path}")
+                # The unified format uses 'relationships' at the top level
+                # Each relationship has target_table, column_mappings, etc.
+                self.knowledge_insights = data.get("relationships", [])
+                logger.info(f"Loaded {len(self.knowledge_insights)} relationships from {json_path}")
         except FileNotFoundError:
             logger.warning(f"Insights file {json_path} not found. Skipping.")
         except Exception as e:

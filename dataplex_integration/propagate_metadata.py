@@ -7,7 +7,11 @@ import os
 from google.cloud import bigquery
 from google.cloud import dataplex_v1
 from lineage_propagation import LineageGraphTraverser, DerivationIdentifier
-from dataset_insights import DescriptionPropagator
+from insights_connector import DataInsightsClient as DescriptionPropagator
+from dotenv import load_dotenv
+
+# Load configuration from .env
+load_dotenv(override=True)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -43,6 +47,18 @@ def update_column_description(project_id, dataset_id, table_id, column_name, des
     except Exception as e:
         logger.error(f"Failed to update description for {column_name}: {e}")
 
+def update_table_description(project_id, dataset_id, table_id, description, credentials=None):
+    """Updates the top-level description of a BigQuery table."""
+    client = bigquery.Client(project=project_id, credentials=credentials)
+    table_ref = f"{project_id}.{dataset_id}.{table_id}"
+    try:
+        table = client.get_table(table_ref)
+        table.description = description
+        client.update_table(table, ["description"])
+        logger.info(f"Updated table description for {table_id}")
+    except Exception as e:
+        logger.error(f"Failed to update table description for {table_id}: {e}")
+
 def log_for_steward_review(project_id, dataset_id, table_id, column, description, confidence, source_info):
     """Logs moderate confidence propagations to a local CSV file for Steward Review."""
     file_exists = os.path.isfile('steward_review_pending.csv')
@@ -65,6 +81,30 @@ def log_for_steward_review(project_id, dataset_id, table_id, column, description
             'status': 'PENDING'
         })
     logger.info(f"Logged {table_id}.{column} for Steward Review (Confidence: {confidence})")
+
+def propagate_table_level(project_id, dataset_id, target_table, description_propagator, mode, credentials=None):
+    """Propagates table-level descriptions (overviews) from insights."""
+    client = bigquery.Client(project=project_id, credentials=credentials)
+    table_ref = f"{project_id}.{dataset_id}.{target_table}"
+    
+    try:
+        table = client.get_table(table_ref)
+        if table.description:
+            logger.info(f"Table {target_table} already has a description. Skipping.")
+            return
+
+        known_relationships = description_propagator.knowledge_json.get("relationships", [])
+        for rel in known_relationships:
+            if rel.get("target_table") == target_table:
+                overview = rel.get("table_overview")
+                if overview:
+                    logger.info(f"Applying table-level overview to {target_table} (Source: Dataplex AI)")
+                    if mode == 'apply':
+                        update_table_description(project_id, dataset_id, target_table, overview, credentials=credentials)
+                    return # Only one overview per table
+                    
+    except Exception as e:
+        logger.error(f"Error in table-level propagation for {target_table}: {e}")
 
 def propagate_pull(project_id, dataset_id, target_table, lineage_traverser, description_propagator, mode, credentials=None):
     """
@@ -261,6 +301,7 @@ def main():
 
     # 3. Pull Mode
     if args.target_table:
+        propagate_table_level(args.project_id, args.dataset_id, args.target_table, description_propagator, args.mode)
         propagate_pull(args.project_id, args.dataset_id, args.target_table, lineage_traverser, description_propagator, args.mode)
 
 if __name__ == "__main__":

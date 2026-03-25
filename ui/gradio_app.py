@@ -10,7 +10,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from dotenv import load_dotenv
 
 # Load environment variables
-load_dotenv()
+load_dotenv(override=True)
 
 # --- Custom OAuth Setup ---
 oauth_config = OAuth()
@@ -47,11 +47,9 @@ DEFAULT_LOCATION = "europe-west1"
 DEFAULT_DATASET_ID = os.environ.get("BIGQUERY_DATASET_ID", "retail_syn_data")
 DEFAULT_GOVERNANCE_DATASET_ID = os.environ.get("GOVERNANCE_DATASET_ID", "governance_results")
 
-KNOWLEDGE_JSON_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "../dataplex_integration/dataset_insights_sample.json"))
+KNOWLEDGE_JSON_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "../knowledge_insights.json"))
 
 def get_plugin(project_id, location):
-    # For demo efficiency, we can cache the plugin instance per project/location
-    # but for simplicity here we just re-instantiate or assume one at a time.
     return LineagePlugin(project_id, location, knowledge_json_path=KNOWLEDGE_JSON_PATH)
 
 def get_token_from_session(request: gr.Request):

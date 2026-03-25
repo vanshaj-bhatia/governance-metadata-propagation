@@ -102,14 +102,15 @@ python3 steward_cli.py policy-propagate --dataset retail_syn_data --table transa
 
 # Analyze and propagate trust/DQ scores for a view or table
 python3 steward_cli.py dq-propagate --dataset retail_syn_data --table customers
+
+# NEW: End-to-end Dataplex AI Insight propagation (Trigger -> Extract -> Apply)
+# This handles the full scan, wait, and metadata update in one go.
+python3 steward_cli.py dataplex-propagate --dataset retail_syn_data --table transactions --apply
 ```
 
 ### 3. Data Integration Scripts
 - **Generate Data**: `python3 data_generation/generate_data.py` (Creates tables + lineage).
-- **Dataset Insights**: `python3 dataplex_integration/dataset_insights.py` (Applies dataset-level labels).
-  > [!NOTE]
-  > The **Dataset Insights** script is not yet fully integrated into the automated propagation flow; currently, the system relies on the pre-generated `dataset_insights_sample.json` for lineage enrichment.
-- **Table Insights**: `python3 dataplex_integration/manage_insights.py` (Automates documentation scans).
+- **Unified Insights**: `python3 dataplex_integration/insights_connector.py` (Triggers, waits and extracts documentation results).
 
 ---
 
@@ -131,8 +132,7 @@ python3 steward_cli.py dq-propagate --dataset retail_syn_data --table customers
 ## 💡 Workflow Example
 
 1.  **Initialize**: Generate synthetic data and lineage relationships.
-2.  **Enrich**: Run **Dataset Insights** and Table Insight scans to populate initial metadata.
-3.  **Propagate**: Use the **Steward App** or **CLI** to bridge description gaps across the lineage chain.
+2.  **Enrich & Propagate**: Run the unified `dataplex-propagate` command to trigger AI scans and sync metadata.
 4.  **Tag**: Use the **Glossary Plugin** to map technical columns to the Business Glossary for Dataplex UI visibility.
 5.  **Secure**: Use the **Policy Tag Propagation** plugin to sync sensitive data tags and verify access summary (Readers/Masking Rules).
 6.  **Verify**: Check the **BigQuery Console** (Schema -> Policy Tags) and **Dataplex Schema** (Business Terms).

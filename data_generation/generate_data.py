@@ -7,6 +7,11 @@ from google.cloud import bigquery
 from faker import Faker
 import pandas as pd
 
+from dotenv import load_dotenv
+
+# Load configuration from .env
+load_dotenv(override=True)
+
 # Configuration
 PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT")
 DATASET_ID = os.environ.get("BIGQUERY_DATASET_ID", "retail_syn_data")

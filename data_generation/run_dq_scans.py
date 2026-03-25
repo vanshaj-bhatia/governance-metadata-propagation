@@ -3,7 +3,7 @@ import sys
 from dotenv import load_dotenv
 
 # Load configurations from .env
-load_dotenv()
+load_dotenv(override=True)
 
 # Add root to sys.path to allow importing from dataplex_integration
 sys.path.append(os.getcwd())

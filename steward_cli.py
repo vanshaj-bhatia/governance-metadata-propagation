@@ -7,12 +7,20 @@ from typing import List, Dict, Any
 # Add necessary paths
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), 'agent/plugins')))
 
+from dotenv import load_dotenv
+# Load configurations from .env
+load_dotenv(override=True)
+
 try:
     from lineage_plugin import LineagePlugin
     from glossary_plugin import GlossaryPlugin
     from policy_tag_plugin import PolicyTagPlugin
     from dq_plugin import DQPlugin
     from dq_propagation import DQPropagationEngine
+    # Import unified insights connector
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), 'dataplex_integration')))
+    from insights_connector import DataInsightsClient
+    import propagate_metadata
 except ImportError as e:
     print(f"Error: Could not import Plugins. {e}")
     sys.exit(1)
@@ -54,6 +62,12 @@ def main():
     dq_propagate_parser = subparsers.add_parser("dq-propagate", help="Analyze and propagate trust/DQ scores for a table or view")
     dq_propagate_parser.add_argument("--dataset", "--dataset_id", dest="dataset", required=True, help="BigQuery Dataset ID")
     dq_propagate_parser.add_argument("--table", "--table_id", dest="table", required=True, help="BigQuery Table or View ID")
+
+    # Dataplex Propagate command (Unified)
+    dataplex_propagate_parser = subparsers.add_parser("dataplex-propagate", help="End-to-end Dataplex AI Insight propagation (Trigger -> Extract -> Apply)")
+    dataplex_propagate_parser.add_argument("--dataset", "--dataset_id", dest="dataset", required=True, help="BigQuery Dataset ID")
+    dataplex_propagate_parser.add_argument("--table", "--table_id", dest="table", help="Specific BigQuery Table ID (optional)")
+    dataplex_propagate_parser.add_argument("--apply", action="store_true", help="Apply updates to BigQuery")
     
     args = parser.parse_args()
     
@@ -233,6 +247,48 @@ def main():
         print("\nColumn Trust Metrics (Calculated from Upstream Leaves):")
         print(df.to_string(index=False))
         print("\nNote: Trust history for these columns has been updated and persisted to BigQuery.")
+
+    elif args.command == "dataplex-propagate":
+        from insights_connector import DataInsightsClient as DescriptionPropagator
+        from insights_connector import DataInsightsClient
+        import propagate_metadata
+        from lineage_propagation import LineageGraphTraverser
+
+        print(f"🚀 Starting Unified Dataplex Insights Workflow for {args.dataset}{'.' + args.table if args.table else ''}...")
+        
+        client = DataInsightsClient(project_id=args.project, location=args.location)
+        
+        # 1. Trigger -> Wait -> Extract
+        print("--- Phase 1: Dataplex AI Scan & Extraction ---")
+        insights = client.run_full_sync(dataset_id=args.dataset, table_id=args.table)
+        
+        if not insights:
+            print("❌ Failed to retrieve insights from Dataplex.")
+            return
+
+        # 2. Apply (Pull Mode)
+        print("\n--- Phase 2: Metadata Propagation ---")
+        mode = "apply" if args.apply else "report"
+        knowledge_json = "knowledge_insights.json"
+        
+        # Initialize propagation components
+        lineage_traverser = LineageGraphTraverser(args.project, args.location)
+        lineage_traverser.load_knowledge_insights(knowledge_json)
+        description_propagator = DescriptionPropagator(args.project) 
+        description_propagator.knowledge_json = insights # Use results from memory
+        
+        tables_to_sync = [args.table] if args.table else [] 
+        if not args.table:
+             # If no table specified, extract target tables from the insights we just generated
+             tables_to_sync = list(set([rel.get("target_table") for rel in insights.get("relationships", [])]))
+
+        for table in tables_to_sync:
+            if not table: continue
+            print(f"\nSyncing metadata for table: {table}")
+            propagate_metadata.propagate_table_level(args.project, args.dataset, table, description_propagator, mode)
+            propagate_metadata.propagate_pull(args.project, args.dataset, table, lineage_traverser, description_propagator, mode)
+
+        print("\n✅ Dataplex Insights propagation complete.")
 
     else:
 
