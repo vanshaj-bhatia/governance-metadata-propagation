@@ -119,14 +119,22 @@ class TransformationEnricher:
         sql_clean = re.sub(r'\s+', ' ', sql_clean).strip()
         
         # Look for SELECT ... AS target_col or SELECT target_col AS ...
-        # Use word boundaries \b to ensure exact matches only (e.g. 'amount' vs 'amount_discounted')
-        pattern = rf"([^,]*?)\s+as\s+`?\b{target_col}\b`?"
-        match = re.search(pattern, sql_clean, re.IGNORECASE)
+        # New pattern: ALSO match 'SELECT ... {target_col},' or 'SELECT ... {target_col} FROM' handles passthrough
+        pattern_as = rf"([^,]*?)\s+as\s+`?\b{target_col}\b`?"
+        match = re.search(pattern_as, sql_clean, re.IGNORECASE)
         
+        if not match:
+            # Fallback for simple passthrough (no AS): SELECT col, or SELECT ... , col, or SELECT col FROM
+            pattern_passthrough = rf"(\b{target_col}\b)(?:,|$|\s+FROM)"
+            match = re.search(pattern_passthrough, sql_clean, re.IGNORECASE)
+            
         if match:
             expr = match.group(1).strip()
-            # Clean up leading SELECT if present, and anything before it (like CREATE TABLE ... AS)
-            # Find the last 'SELECT' in the expression if it exists
+            # If it's a passthrough, we need the whole SELECT part if there's a DISTINCT
+            if "DISTINCT " in sql_clean.upper() and expr == target_col:
+                expr = f"DISTINCT {expr}"
+            
+            # Clean up leading SELECT if present
             last_select = re.split(r'\bSELECT\b', expr, flags=re.IGNORECASE)[-1]
             return last_select.strip()
         
@@ -193,6 +201,11 @@ class TransformationEnricher:
         description = description.strip()
         if description.endswith('.'):
             description = description[:-1]
+            
+        # Clean up the Insights prefix if it exists in the original description from an upstream schema
+        prefix_to_remove = "Propagated via Dataset Insights: "
+        if description.startswith(prefix_to_remove):
+            description = description[len(prefix_to_remove):].strip()
 
         # Add source context if significantly different - REMOVED AS PER USER REQUEST
         # The source is already tracked in separate columns
@@ -228,10 +241,10 @@ class LineageGraphTraverser:
         try:
             with open(json_path, 'r') as f:
                 data = json.load(f)
-                # Navigate to schemaRelationships
-                # data -> datasetResult -> schemaRelationships
-                self.knowledge_insights = data.get("datasetResult", {}).get("schemaRelationships", [])
-                logger.info(f"Loaded {len(self.knowledge_insights)} schema relationships from {json_path}")
+                # The unified format uses 'relationships' at the top level
+                # Each relationship has target_table, column_mappings, etc.
+                self.knowledge_insights = data.get("relationships", [])
+                logger.info(f"Loaded {len(self.knowledge_insights)} relationships from {json_path}")
         except FileNotFoundError:
             logger.warning(f"Insights file {json_path} not found. Skipping.")
         except Exception as e:

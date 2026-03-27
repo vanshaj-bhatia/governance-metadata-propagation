@@ -17,3 +17,4 @@ google-cloud-datacatalog
 google-cloud-aiplatform
 google-genai
 google-cloud-bigquery-datapolicies
+google-cloud-recommender

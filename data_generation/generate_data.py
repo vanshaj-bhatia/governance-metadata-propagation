@@ -1,20 +1,28 @@
 import os
 import random
+import sys
+from typing import Dict
 from datetime import datetime, timedelta
 from google.cloud import bigquery
 from faker import Faker
 import pandas as pd
 
+from dotenv import load_dotenv
+
+# Load configuration from .env
+load_dotenv(override=True)
+
 # Configuration
 PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT")
-DATASET_ID = "retail_syn_data"
+DATASET_ID = os.environ.get("BIGQUERY_DATASET_ID", "retail_syn_data")
+GOVERNANCE_DATASET_ID = os.environ.get("GOVERNANCE_DATASET_ID", "governance_results")
 LOCATION = "europe-west1"
 
 client = bigquery.Client(project=PROJECT_ID)
 fake = Faker(['en_GB', 'fr_FR', 'de_DE', 'sv_SE']) # European locales
 
-def create_dataset():
-    dataset_id = f"{PROJECT_ID}.{DATASET_ID}"
+def create_dataset(dataset_name):
+    dataset_id = f"{PROJECT_ID}.{dataset_name}"
     dataset = bigquery.Dataset(dataset_id)
     dataset.location = LOCATION
     try:
@@ -135,10 +143,13 @@ def create_derived_table(source_table, target_table, custom_query=None):
     job.result()
     print(f"Created {target_table} from {source_table} (Lineage established)")
 
-def create_view(source_table, view_name):
+def create_view(source_table, view_name, custom_query=None):
     """Creates a view over a source table."""
     view_id = f"{PROJECT_ID}.{DATASET_ID}.{view_name}"
-    query = f"CREATE OR REPLACE VIEW `{view_id}` AS SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.{source_table}`"
+    if custom_query:
+        query = custom_query
+    else:
+        query = f"CREATE OR REPLACE VIEW `{view_id}` AS SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.{source_table}`"
     
     # Execute
     job = client.query(query)
@@ -165,12 +176,33 @@ def attach_policy_tags(table_id, column_tags: Dict[str, str]):
     except Exception as e:
         print(f"Warning: Failed to attach policy tags to {table_id}. Ensure tags exist. Error: {e}")
 
+def create_dq_history_table(dataset_id):
+    """Creates the DQ propagation history table if it doesn't exist."""
+    table_id = f"{PROJECT_ID}.{dataset_id}.dq_propagation_history"
+    schema = [
+        bigquery.SchemaField("table_fqn", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("column_name", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("snapshot_time", "TIMESTAMP", mode="REQUIRED"),
+        bigquery.SchemaField("dq_score", "FLOAT", mode="REQUIRED"),
+        bigquery.SchemaField("dimensions", "STRING", mode="NULLABLE"),
+        bigquery.SchemaField("source_type", "STRING", mode="NULLABLE"),
+    ]
+    table = bigquery.Table(table_id, schema=schema)
+    try:
+        client.get_table(table_id)
+        print(f"Table {table_id} already exists.")
+    except Exception:
+        client.create_table(table)
+        print(f"Created table {table_id}")
+
 if __name__ == "__main__":
     if not PROJECT_ID:
         print("Please set GOOGLE_CLOUD_PROJECT environment variable.")
         exit(1)
         
-    create_dataset()
+    create_dataset(DATASET_ID)
+    create_dataset(GOVERNANCE_DATASET_ID)
+    create_dq_history_table(GOVERNANCE_DATASET_ID)
     
     print("Generating raw data...")
     raw_customers_df = generate_raw_customers()
@@ -209,6 +241,17 @@ if __name__ == "__main__":
     print("Creating Views for Multi-Hop Lineage Testing...")
     create_view("transactions", "transactions_v")
     create_view("products", "products_v")
+    
+    print("Creating Aggregate View for Distinct Count Testing...")
+    product_stats_query = f"""
+    CREATE OR REPLACE VIEW `{PROJECT_ID}.{DATASET_ID}.product_stats_v` AS
+    SELECT 
+        category, 
+        COUNT(DISTINCT product_id) as distinct_product_count
+    FROM `{PROJECT_ID}.{DATASET_ID}.products`
+    GROUP BY category
+    """
+    create_view("products", "product_stats_v", custom_query=product_stats_query)
     
     # --- ADDED: Policy Tag Testing Support ---
     # NOTE: Replace these with actual policy tag resource names in your environment
