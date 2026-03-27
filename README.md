@@ -10,13 +10,13 @@ This project demonstrates an agentic data governance solution using Google Cloud
 *   **Recursive Description Propagation**: Automatically fetch descriptions from upstream sources, bridging multi-hop gaps.
 *   **SQL-Based Logic Enrichment**: Extracts BigQuery SQL transformations to generate human-readable descriptions for computed columns.
 *   **AI Business Glossary**: Maps technical columns to business terms using Vertex AI Semantic Similarity.
-*   **Prioritized Lineage Propagation**: Automatically propagates glossary terms across tables based on lineage, with strict verification thresholds to ensure accuracy (especially for 1-1 mappings).
+*   **Prioritized Glossary Propagation**: Automatically propagates glossary terms across tables based on lineage, with strict verification thresholds to ensure accuracy (especially for 1-1 mappings).
 *   **Native Dataplex Integration**: Persists glossary mappings as native `EntryLinks` visible in the Dataplex Schema tab.
 *   **Unified UI & CLI**: Manage governance tasks via a Gradio-based web app or a headless CLI.
 *   **Policy Tag Propagation**: Recommends and applies BigQuery policy tags via lineage, with support for "straight pull" detection and an integrated **Access Summary** (Readers & Data Policies).
 *   **Data Trust Center (DQ)**: Derived trust scores for views and tables based on upstream Dataplex DQ/Profiling results and multi-hop lineage.
 *   **Remediation Detection**: Automatically detects SQL transformations (e.g. `COALESCE`, `DISTINCT`) that improve data quality and applies "Trust Bonuses".
-*   **Trust History Persistence**: Tracks 0.0-1.0 trust scores over time in BigQuery and local history for trend analysis.
+*   **Trust History Persistence**: Tracks 0.0-1.0 trust scores over time in BigQuery for trend analysis.
 *   **CLL API Preview allowlisting required**: Please contact your Google Cloud account team to get access to CLL API
 
 ---
@@ -55,6 +55,7 @@ python3 ui/gradio_app.py
 ```
 - **Dashboard**: Run "Scan Dataset" to see health metrics.
 - **Description Propagation**: Enter a table name to preview and apply lineage-based descriptions.
+- **Glossary Propagation**: Enter a table name to preview and apply lineage-based glossary terms.
 - **Policy Tag Propagation**: Propagate sensitive data tags across the lineage chain with automated transformation assessment.
 - **Trust Center (DQ)**: Analyze derived trust scores for a view or table, showing upstream quality sources and remediation bonuses.
 - **Settings**: Toggle OAuth/ADC modes for specific user actions.
@@ -110,6 +111,7 @@ python3 steward_cli.py dataplex-propagate --dataset retail_syn_data --table tran
 
 ### 3. Data Integration Scripts
 - **Generate Data**: `python3 data_generation/generate_data.py` (Creates tables + lineage).
+- **Run Profiling & DQ**: `python3 data_generation/run_dq_scans.py` (Creates and runs Data Profile and Quality scans, natively published to BigQuery).
 - **Unified Insights**: `python3 dataplex_integration/insights_connector.py` (Triggers, waits and extracts documentation results).
 
 ---

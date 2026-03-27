@@ -18,9 +18,7 @@ class TestDQPropagation(unittest.TestCase):
         self.dq_plugin = DQPlugin(self.project_id, self.location)
         self.engine = DQPropagationEngine(self.project_id, self.location)
         
-        # Cleanup history file if it exists
-        if os.path.exists("dq_history.json"):
-            os.remove("dq_history.json")
+
 
     @patch('dq_plugin.get_credentials')
     @patch('google.cloud.dataplex_v1.DataScanServiceClient')
@@ -73,35 +71,57 @@ class TestDQPropagation(unittest.TestCase):
         bonus = self.engine.detect_remediation("ds", "table", "id")
         self.assertEqual(bonus, 0.1)
 
-    def test_history_rolling_window(self):
+    @patch('google.cloud.bigquery.Client')
+    @patch('context.get_credentials')
+    def test_history_bq_insert(self, mock_creds, mock_bq_client):
+        mock_client_instance = mock_bq_client.return_value
+        # Mock insert_rows_json to return no errors
+        mock_client_instance.insert_rows_json.return_value = []
+        
         fqn = "bigquery:p.d.t"
         col = "c1"
+        self.engine.update_history(fqn, col, 0.75, "DERIVED", {"COMPLETENESS": 1.0})
         
-        for i in range(10):
-            self.engine.update_history(fqn, col, 0.5 + (i * 0.01))
-            
-        with open("dq_history.json", 'r') as f:
-            history = json.load(f)
-            
-        snapshots = history[f"{fqn}#{col}"]
-        self.assertEqual(len(snapshots), 5)
-        # Latest should be at the top
-        self.assertEqual(snapshots[0]['score'], 0.59)
+        # Verify BQ insert was called
+        mock_client_instance.insert_rows_json.assert_called_once()
+        args, kwargs = mock_client_instance.insert_rows_json.call_args
+        rows = args[1]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['table_fqn'], fqn)
+        self.assertEqual(rows[0]['column_name'], col)
+        self.assertEqual(rows[0]['dq_score'], 0.75)
 
-    def test_trend_calculation(self):
+    @patch('google.cloud.bigquery.Client')
+    @patch('context.get_credentials')
+    def test_trend_calculation(self, mock_creds, mock_bq_client):
+        mock_client_instance = mock_bq_client.return_value
+        
         fqn = "bigquery:p.d.t"
         col = "c1"
         
-        # Improving trend
-        self.engine.update_history(fqn, col, 0.7) # old
-        self.engine.update_history(fqn, col, 0.9) # new
+        # Mock the BQ query job to return improving trend data
+        mock_query_job = MagicMock()
+        # Newer first, older second: 0.9 > 0.7 + 0.05
+        mock_row_1 = MagicMock(); mock_row_1.dq_score = 0.9
+        mock_row_2 = MagicMock(); mock_row_2.dq_score = 0.7
+        mock_query_job.__iter__.return_value = [mock_row_1, mock_row_2]
+        
+        mock_client_instance.query.return_value = mock_query_job
         
         trend = self.engine.get_trend(fqn, col)
         self.assertEqual(trend, "improving")
-
-    def tearDown(self):
-        if os.path.exists("dq_history.json"):
-            os.remove("dq_history.json")
+        
+        # Also test degrading
+        mock_row_1.dq_score = 0.5
+        mock_row_2.dq_score = 0.8
+        trend = self.engine.get_trend(fqn, col)
+        self.assertEqual(trend, "degrading")
+        
+        # And stable
+        mock_row_1.dq_score = 0.81
+        mock_row_2.dq_score = 0.80
+        trend = self.engine.get_trend(fqn, col)
+        self.assertEqual(trend, "stable")
 
 if __name__ == '__main__':
     unittest.main()

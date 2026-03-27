@@ -15,7 +15,6 @@ class DQPropagationEngine:
         self.token = token
         self._traverser = LineageGraphTraverser(project_id, location, token=token)
         self._sql_fetcher = None # Lazy load
-        self.history_file = "dq_history.json"
         self.bq_history_table = "dq_propagation_history"
         self.dataset_id = os.environ.get("GOVERNANCE_DATASET_ID", "governance_results")
 
@@ -78,32 +77,8 @@ class DQPropagationEngine:
 
     def update_history(self, fqn: str, column: str, score: float, source_type: str = "DERIVED", dimensions: Dict[str, float] = None):
         """
-        Maintains a rolling history of 5 snapshots in a local JSON file and persists to BigQuery.
+        Persists data quality history directly to BigQuery.
         """
-        # 1. Local JSON Update
-        history = {}
-        if os.path.exists(self.history_file):
-            try:
-                with open(self.history_file, 'r') as f:
-                    history = json.load(f)
-            except:
-                pass
-        
-        key = f"{fqn}#{column}"
-        snapshots = history.get(key, [])
-        
-        snapshots.insert(0, {
-            "time": datetime.datetime.now().isoformat(),
-            "score": round(score, 3),
-            "source_type": source_type
-        })
-        
-        history[key] = snapshots[:5]
-        
-        with open(self.history_file, 'w') as f:
-            json.dump(history, f, indent=2)
-
-        # 2. BigQuery Update
         try:
             from google.cloud import bigquery
             from context import get_credentials
@@ -128,26 +103,46 @@ class DQPropagationEngine:
 
     def get_trend(self, fqn: str, column: str) -> str:
         """
-        Calculates the trend based on history.
+        Calculates the trend based on history retrieved from BigQuery.
         """
-        if not os.path.exists(self.history_file):
+        try:
+            from google.cloud import bigquery
+            from context import get_credentials
+            
+            client = bigquery.Client(project=self.project_id, credentials=get_credentials(self.project_id))
+            table_id = f"{self.project_id}.{self.dataset_id}.{self.bq_history_table}"
+            
+            query = f"""
+                SELECT dq_score
+                FROM `{table_id}`
+                WHERE table_fqn = @fqn AND column_name = @column
+                ORDER BY snapshot_time DESC
+                LIMIT 5
+            """
+            
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("fqn", "STRING", fqn),
+                    bigquery.ScalarQueryParameter("column", "STRING", column),
+                ]
+            )
+            
+            query_job = client.query(query, job_config=job_config)
+            snapshots = [row.dq_score for row in query_job]
+            
+            if len(snapshots) < 2:
+                return "stable"
+                
+            current = snapshots[0]
+            previous = sum(snapshots[1:]) / (len(snapshots) - 1)
+            
+            if current > previous + 0.05: return "improving"
+            if current < previous - 0.05: return "degrading"
             return "stable"
             
-        with open(self.history_file, 'r') as f:
-            history = json.load(f)
-            
-        key = f"{fqn}#{column}"
-        snapshots = history.get(key, [])
-        
-        if len(snapshots) < 2:
+        except Exception as e:
+            logger.warning(f"Error calculating trend from BQ: {e}")
             return "stable"
-            
-        current = snapshots[0]['score']
-        previous = sum(s['score'] for s in snapshots[1:]) / (len(snapshots) - 1)
-        
-        if current > previous + 0.05: return "improving"
-        if current < previous - 0.05: return "degrading"
-        return "stable"
 
     def propagate_dq_scores(self, target_fqn: str, dataset_id: str, table_name: str, columns: List[str]):
         """

@@ -201,6 +201,11 @@ class TransformationEnricher:
         description = description.strip()
         if description.endswith('.'):
             description = description[:-1]
+            
+        # Clean up the Insights prefix if it exists in the original description from an upstream schema
+        prefix_to_remove = "Propagated via Dataset Insights: "
+        if description.startswith(prefix_to_remove):
+            description = description[len(prefix_to_remove):].strip()
 
         # Add source context if significantly different - REMOVED AS PER USER REQUEST
         # The source is already tracked in separate columns

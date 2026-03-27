@@ -59,7 +59,8 @@ def create_dq_scan(table_name, credentials=None):
             bigquery_export=dataplex_v1.DataQualitySpec.PostScanActions.BigQueryExport(
                 results_table=f"//bigquery.googleapis.com/projects/{PROJECT_ID}/datasets/{GOVERNANCE_DATASET_ID}/tables/{table_name}_dq_results"
             )
-        )
+        ),
+        catalog_publishing_enabled=True
     )
     
     data_scan = dataplex_v1.DataScan()
@@ -99,7 +100,8 @@ def create_profiling_scan(table_name, credentials=None):
             bigquery_export=dataplex_v1.DataProfileSpec.PostScanActions.BigQueryExport(
                 results_table=f"//bigquery.googleapis.com/projects/{PROJECT_ID}/datasets/{GOVERNANCE_DATASET_ID}/tables/{table_name}_profile_results"
             )
-        )
+        ),
+        catalog_publishing_enabled=True
     )
     
     data_scan = dataplex_v1.DataScan()

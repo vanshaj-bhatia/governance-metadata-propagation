@@ -44,7 +44,7 @@ To track 5 snapshots, we will use a table `dq_propagation_history`:
 3. For each source column, retrieve the latest 1.0-scaled DQ score (prioritizing Auto DQ).
 4. Apply aggregation function (default: `conservative_min`).
 5. Run transformation heuristics on intermediate SQL joins/selects to detect remediation.
-6. Store derived score in the History table (locally in `dq_history.json` or BQ) and return to UI.
+6. Store derived score in the History table (in BQ) and return to UI.
 
 ## 4. UI/CLI Integration
 - **Badge logic**: 

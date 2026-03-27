@@ -166,7 +166,7 @@ def propagate_pull(project_id, dataset_id, target_table, lineage_traverser, desc
                                 "source_col": mapping.get("source_col"),
                                 "confidence": mapping.get("confidence"),
                                 "type": mapping.get("type"),
-                                "desc": "Propagated via Dataset Insights: " + mapping.get("explanation", "")
+                                "desc": mapping.get("explanation", "")
                             })
 
         if candidates:

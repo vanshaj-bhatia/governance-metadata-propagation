@@ -262,6 +262,11 @@ def get_dq_propagation(project_id, location, dataset_id, table_id, request: gr.R
             leaves = data.get("leaves", [])
             bonus = data.get("bonus", 0.0)
             
+            # Filter leaves to only the highest confidence ones to remove lineage spillover (JOIN artifacts)
+            if leaves:
+                best_conf = max(leaf.get('confidence', 0) for leaf in leaves)
+                leaves = [leaf for leaf in leaves if leaf.get('confidence', 0) >= best_conf]
+            
             upstream_scores = []
             source_names = []
             for leaf in leaves:
@@ -291,12 +296,20 @@ def get_dq_propagation(project_id, location, dataset_id, table_id, request: gr.R
             # Determine Badge
             badge = "🟢 High" if final_score > 0.9 else ("🟡 Medium" if final_score > 0.7 else "🔴 Low")
             
+            if bonus > 0:
+                if base_score >= 1.0:
+                    bonus_str = f"+{int(bonus*100)}% (Capped)"
+                else:
+                    bonus_str = f"+{int(bonus*100)}%"
+            else:
+                bonus_str = "None"
+
             results.append({
                 "Column": col,
                 "Trust Score": round(final_score, 2),
                 "Badge": badge,
                 "Trend": trend.capitalize(),
-                "Bonus (Remediation)": f"+{int(bonus*100)}%" if bonus > 0 else "None",
+                "Bonus (Remediation)": bonus_str,
                 "Upstream Sources": ", ".join(source_names[:2]) + ("..." if len(source_names) > 2 else "") or "None (Source)"
             })
             
