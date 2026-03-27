@@ -1,5 +1,8 @@
 # Governance Metadata Propagation Demo
 
+> [!WARNING]
+> This is not an official product but a prototype which is not meant for production usage.
+
 This project demonstrates an agentic data governance solution using Google Cloud Dataplex. It showcases how to automate metadata management, propagate insights via lineage, and leverage Dataplex **Dataset Insights** capabilities. This is only a demonstration and is not part of official product, please review everything before using it for your environments and use-cases.
 
 ---
