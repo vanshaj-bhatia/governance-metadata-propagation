@@ -1,4 +1,4 @@
-gradio[oauth]
+gradio[oauth]==4.44.0
 requests
 google-cloud-dataplex
 google-cloud-bigquery

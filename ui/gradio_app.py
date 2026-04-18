@@ -33,9 +33,9 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../agen
 from lineage_plugin import LineagePlugin
 from glossary_plugin import GlossaryPlugin
 from policy_tag_plugin import PolicyTagPlugin
-from context import set_oauth_token
 from dq_plugin import DQPlugin
 from dq_propagation import DQPropagationEngine
+from context import set_oauth_token
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO)
@@ -45,7 +45,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT", "governance-agent")
 DEFAULT_LOCATION = "europe-west1"
 DEFAULT_DATASET_ID = os.environ.get("BIGQUERY_DATASET_ID", "retail_syn_data")
-DEFAULT_GOVERNANCE_DATASET_ID = os.environ.get("GOVERNANCE_DATASET_ID", "governance_results")
 
 KNOWLEDGE_JSON_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "../knowledge_insights.json"))
 
@@ -104,287 +103,6 @@ def scan_dataset(project_id, location, dataset_id, request: gr.Request = None):
         logger.error(f"Scan failed: {e}")
         raise gr.Error(f"Scan failed: {str(e)}")
 
-def analyze_and_preview(project_id, location, dataset_id, target_table, request: gr.Request = None):
-    token = get_token_from_session(request)
-    set_oauth_token(token)
-    try:
-        plugin = get_plugin(project_id, location)
-        
-        # 1. Get Summary
-        summary = plugin.get_lineage_summary(dataset_id, target_table)
-        
-        # 2. Get Preview DF
-        df = plugin.preview_propagation(dataset_id, target_table)
-        if df.empty:
-            gr.Warning(f"No upstream candidates found for {target_table}.")
-            return summary, pd.DataFrame(columns=["Select", "Target Column", "Source", "Source Column", "Confidence", "Proposed Description", "Type"])
-            
-        # Add selection column - simple list assignment is safer for synchronization
-        df.insert(0, "Select", [True] * len(df))
-        return summary, df
-    except Exception as e:
-        logger.error(f"Analyze & Preview failed: {e}")
-        raise gr.Error(f"Operation failed: {str(e)}")
-
-def get_glossary_recommendations(project_id, location, dataset_id, table_id, request: gr.Request = None):
-    token = get_token_from_session(request)
-    set_oauth_token(token)
-    try:
-        plugin = GlossaryPlugin(project_id, location)
-        df = plugin.recommend_terms_for_table(dataset_id, table_id)
-        if df.empty:
-            gr.Info(f"No glossary recommendations found for {table_id}.")
-            return pd.DataFrame(columns=["Select", "Column", "Suggested Term", "Confidence", "Rationale", "Term ID"])
-        
-        # Add selection column
-        df.insert(0, "Select", [True] * len(df))
-        return df
-    except Exception as e:
-        logger.error(f"Glossary recommendations failed: {e}")
-        raise gr.Error(f"Operation failed: {str(e)}")
-
-def get_policy_tag_recommendations(project_id, location, dataset_id, table_id, request: gr.Request = None):
-    token = get_token_from_session(request)
-    set_oauth_token(token)
-    try:
-        plugin = PolicyTagPlugin(project_id, location)
-        df = plugin.preview_policy_tag_propagation(dataset_id, table_id)
-        if df.empty:
-            gr.Info(f"No policy tag recommendations found for {table_id}.")
-            return pd.DataFrame(columns=["Select", "Target Column", "Source Table", "Policy Tags", "Recommendation", "Logic", "Access Summary"])
-        
-        # Add selection column
-        df.insert(0, "Select", [True] * len(df))
-        return df
-    except Exception as e:
-        logger.error(f"Policy tag recommendations failed: {e}")
-        raise gr.Error(f"Operation failed: {str(e)}")
-
-def apply_policy_tag_recommendations(project_id, location, dataset_id, target_table, recommendations_df, additional_readers, request: gr.Request = None):
-    token = get_token_from_session(request)
-    set_oauth_token(token)
-    try:
-        if recommendations_df is None or recommendations_df.empty:
-            raise gr.Error("No recommendations to apply.")
-        
-        # Filter selected rows
-        recommendations_df["Select"] = recommendations_df["Select"].astype(bool)
-        selected = recommendations_df[recommendations_df["Select"] == True]
-        
-        if selected.empty:
-            gr.Warning("No columns selected for application.")
-            return "No columns selected."
-            
-        plugin = PolicyTagPlugin(project_id, location)
-        updates = []
-        for _, row in selected.iterrows():
-            update = {
-                "table": target_table,
-                "column": row['Target Column'],
-                "policy_tag": row['Policy Tags'].split(", ")[0]
-            }
-            
-            # Aggregate readers (only additional readers now, as source readers are handled as a summary)
-            all_readers = []
-            if additional_readers:
-                all_readers.extend([r.strip() for r in additional_readers.split(",") if r.strip()])
-            
-            if all_readers:
-                update["readers"] = list(set(all_readers))
-                
-            updates.append(update)
-            
-        plugin.apply_policy_tags(dataset_id, updates)
-        return f"Successfully applied {len(updates)} policy tags to {target_table}!"
-    except Exception as e:
-        logger.error(f"Policy tag apply failed: {e}")
-        raise gr.Error(f"Apply failed: {str(e)}")
-
-def apply_propagation_improved(project_id, location, dataset_id, target_table, candidates_df, request: gr.Request = None):
-    token = get_token_from_session(request)
-    set_oauth_token(token)
-    try:
-        if candidates_df is None or candidates_df.empty:
-            raise gr.Error("No candidates to apply.")
-        
-        # Filter selected rows
-        # Force 'Select' column to boolean to avoid string-mismatch in some versions/environments
-        candidates_df["Select"] = candidates_df["Select"].astype(bool)
-        selected = candidates_df[candidates_df["Select"] == True]
-        logger.info(f"Applying propagation: {len(selected)} selected rows out of {len(candidates_df)}")
-        
-        if selected.empty:
-            gr.Warning("No columns selected for application.")
-            return "No columns selected."
-            
-        plugin = get_plugin(project_id, location)
-        updates = []
-        for _, row in selected.iterrows():
-            if 'Target Column' in row and 'Proposed Description' in row:
-                updates.append({
-                    "table": target_table,
-                    "column": row['Target Column'],
-                    "description": row['Proposed Description']
-                })
-            
-        if not updates:
-            return "No valid updates found in selection."
-
-        plugin.apply_propagation(dataset_id, updates)
-        return f"Successfully applied {len(updates)} updates to {target_table}!"
-    except Exception as e:
-        logger.error(f"Apply failed: {e}")
-        raise gr.Error(f"Apply failed: {str(e)}")
-
-def get_dq_propagation(project_id, location, dataset_id, table_id, request: gr.Request = None):
-    token = get_token_from_session(request)
-    set_oauth_token(token)
-    try:
-        dq_plugin = DQPlugin(project_id, location)
-        engine = DQPropagationEngine(project_id, location, token=token)
-        
-        # 1. Get DQ summary for target
-        target_fqn = f"bigquery:{project_id}.{dataset_id}.{table_id}"
-        
-        # We need to list columns to analyze
-        from google.cloud import bigquery
-        from context import get_credentials
-        client = bigquery.Client(project=project_id, credentials=get_credentials(project_id))
-        table = client.get_table(f"{project_id}.{dataset_id}.{table_id}")
-        columns = [f.name for f in table.schema]
-        
-        # 2. Perform multi-hop propagation analysis
-        propagation_data = engine.propagate_dq_scores(target_fqn, dataset_id, table_id, columns)
-        
-        results = []
-        for col in columns:
-            data = propagation_data.get(col, {})
-            leaves = data.get("leaves", [])
-            bonus = data.get("bonus", 0.0)
-            
-            # Filter leaves to only the highest confidence ones to remove lineage spillover (JOIN artifacts)
-            if leaves:
-                best_conf = max(leaf.get('confidence', 0) for leaf in leaves)
-                leaves = [leaf for leaf in leaves if leaf.get('confidence', 0) >= best_conf]
-            
-            upstream_scores = []
-            source_names = []
-            for leaf in leaves:
-                src_parts = leaf['source_entity'].split('.')
-                if len(src_parts) == 3:
-                    s_ds, s_tab = src_parts[1], src_parts[2]
-                    # Fetch granular score for specific upstream column
-                    s_summary = dq_plugin.fetch_dq_summary(s_ds, s_tab, leaf.get('source_column'))
-                    upstream_scores.append(s_summary['score'])
-                    source_names.append(f"{s_tab}.{leaf.get('source_column')}")
-            
-            if not upstream_scores:
-                # Fallback to direct table scan if no lineage found
-                summary = dq_plugin.fetch_dq_summary(dataset_id, table_id, col)
-                base_score = summary['score']
-                source_type = summary['source']
-            else:
-                base_score = engine.aggregate_scores(upstream_scores)
-                source_type = "DERIVED"
-            
-            final_score = min(base_score + bonus, 1.0)
-            
-            # 3. Persist to history (JSON & BQ)
-            engine.update_history(target_fqn, col, final_score, source_type=source_type)
-            trend = engine.get_trend(target_fqn, col)
-            
-            # Determine Badge
-            badge = "🟢 High" if final_score > 0.9 else ("🟡 Medium" if final_score > 0.7 else "🔴 Low")
-            
-            if bonus > 0:
-                if base_score >= 1.0:
-                    bonus_str = f"+{int(bonus*100)}% (Capped)"
-                else:
-                    bonus_str = f"+{int(bonus*100)}%"
-            else:
-                bonus_str = "None"
-
-            results.append({
-                "Column": col,
-                "Trust Score": round(final_score, 2),
-                "Badge": badge,
-                "Trend": trend.capitalize(),
-                "Bonus (Remediation)": bonus_str,
-                "Upstream Sources": ", ".join(source_names[:2]) + ("..." if len(source_names) > 2 else "") or "None (Source)"
-            })
-            
-        return pd.DataFrame(results)
-    except Exception as e:
-        logger.error(f"DQ propagation failed: {e}")
-        raise gr.Error(f"Operation failed: {str(e)}")
-
-
-def apply_glossary_selections(project_id, location, dataset_id, table_id, reco_df, request: gr.Request = None):
-    token = get_token_from_session(request)
-    set_oauth_token(token)
-    try:
-        if reco_df is None or reco_df.empty:
-            raise gr.Error("No recommendations to apply.")
-        
-        # Filter selected rows
-        # Ensure 'Select' column is treated as boolean
-        reco_df["Select"] = reco_df["Select"].astype(bool)
-        selected = reco_df[reco_df["Select"] == True]
-        if selected.empty:
-            gr.Warning("No terms selected for application.")
-            return "No terms selected."
-
-        plugin = GlossaryPlugin(project_id, location)
-        updates = []
-        for _, row in selected.iterrows():
-            updates.append({
-                "column": row['Column'],
-                "term_id": row['Term ID'],
-                "term_display": row['Suggested Term']
-            })
-        
-        plugin.apply_terms(dataset_id, table_id, updates)
-        return f"Successfully applied {len(updates)} glossary terms to {table_id} in Dataplex!"
-    except Exception as e:
-        logger.error(f"Glossary apply failed: {e}")
-        raise gr.Error(f"Apply failed: {str(e)}")
-
-def toggle_all_selection(df, value):
-    """Universal helper to toggle a 'Select' column in a dataframe."""
-    if df is not None and not df.empty:
-        # Create a copy to ensure Gradio detects state change
-        df = df.copy()
-        df["Select"] = [bool(value)] * len(df)
-        logger.info(f"Toggled selection to: {value}")
-    return df
-
-def select_all_lineage(df):
-    return toggle_all_selection(df, True)
-
-def deselect_all_lineage(df):
-    return toggle_all_selection(df, False)
-
-def select_all_glossary(df):
-    return toggle_all_selection(df, True)
-
-def deselect_all_glossary(df):
-    return toggle_all_selection(df, False)
-
-def select_all_policy(df):
-    return toggle_all_selection(df, True)
-
-def deselect_all_policy(df):
-    return toggle_all_selection(df, False)
-
-def check_auth_status(request: gr.Request):
-    if request and "google_token" in request.session:
-        # Hide login, show app
-        return gr.update(visible=False), gr.update(visible=True)
-    return gr.update(visible=True), gr.update(visible=False)
-
-
-# --- Custom Google Cloud Console Styling ---
-# We inject this via gr.HTML to ensure it overrides Gradio's internal CSS
 GCP_CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap');
@@ -423,7 +141,6 @@ body, .gradio-container, p {
 }
 
 /* Specific enforcement for Primary Buttons - White Text on Blue */
-/* Nuclear selector for any button that looks primary */
 .primary, .gr-button-primary, button.primary, .lg.primary, .sm.primary,
 button[variant="primary"], .gr-button-primary *, button.primary *,
 .gradio-container button.primary, .gradio-container .primary {
@@ -432,7 +149,6 @@ button[variant="primary"], .gr-button-primary *, button.primary *,
     background-color: #1a73e8 !important;
 }
 
-/* Force white text on the specific button content */
 .primary span, .gr-button-primary span, button.primary span,
 .primary div, .gr-button-primary div, button.primary div {
     color: #ffffff !important;
@@ -443,29 +159,24 @@ button[variant="primary"], .gr-button-primary *, button.primary *,
     color: #ffffff !important;
 }
 
-/* Secondary Buttons - Dark Text on Light Grey */
 .gr-button-secondary, .gr-button-secondary *, button.secondary, button.secondary * {
     color: #202124 !important;
     background-color: #f1f3f4 !important;
     border: 1px solid #dadce0 !important;
 }
 
-/* Fix Input Field & Label Visibility */
 input, textarea, select, .gr-input, .gr-box, .gr-textbox input, .gr-textbox textarea {
     background-color: white !important;
     color: #202124 !important;
     border: 1px solid #dadce0 !important;
 }
 
-/* Force dark labels for all input fields */
 .gr-label, .block label, span[data-testid="block-info"], .gr-form label, .desc-markdown p {
     color: #202124 !important;
     font-weight: 500 !important;
     font-size: 13px !important;
 }
 
-/* --- Table (Dataframe) Force Light Headers & Cells --- */
-/* Target EVERYTHING related to tables to ensure no dark leaks */
 .gr-table, .gr-table-container, table, .dataframe, thead, tbody, tr, th, td {
     background-color: #ffffff !important;
     background: #ffffff !important;
@@ -473,32 +184,28 @@ input, textarea, select, .gr-input, .gr-box, .gr-textbox input, .gr-textbox text
     border-color: #e0e0e0 !important;
 }
 
-/* Specific Header Styling - BLUE BACKGROUND / WHITE TEXT */
 th, thead th, .gr-table thead th, .dataframe thead th, 
-.gr-table th, .dataframe th, [class*="thead"] th,
-.dark th, .dark thead th, .dark .gr-table th {
-    background-color: #1a73e8 !important;
-    background: #1a73e8 !important;
-    color: #ffffff !important;
+.gr-table th, .dataframe th, [class*="thead"] th {
+    background-color: #f1f3f4 !important;
+    background: #f1f3f4 !important;
+    color: #202124 !important;
     font-weight: 500 !important;
     text-transform: uppercase !important;
     font-size: 11px !important;
-    border-bottom: 2px solid #1557b0 !important;
+    border-bottom: 2px solid #dadce0 !important;
     padding: 12px 8px !important;
 }
 
-/* Force white text in all header children specifically, prioritizing text-bearing elements */
+/* Force dark text in all header children specifically */
 th span, th div, .gr-table th span, .gr-table th div,
 .dataframe th span, .dataframe th div {
-    color: #ffffff !important;
+    color: #202124 !important;
 }
 
-/* Force text color in all table cells (excluding headers) */
 tbody td, .dark tbody td, tbody td span, tbody td div {
     color: #202124 !important;
 }
 
-/* Ensure checkboxes are visible and interactive */
 input[type="checkbox"] {
     cursor: pointer !important;
     appearance: checkbox !important;
@@ -507,12 +214,10 @@ input[type="checkbox"] {
     visibility: visible !important;
 }
 
-/* Target row background specifically to avoid stripes being dark */
 tr, .gr-table tr, .dataframe tr {
     background-color: #ffffff !important;
 }
 
-/* Fix black background boxes in Lineage Summary / Markdown */
 .markdown code, .prose code, .markdown span, .prose span {
     background-color: rgba(0,0,0,0.05) !important;
     color: #202124 !important;
@@ -520,13 +225,11 @@ tr, .gr-table tr, .dataframe tr {
     border-radius: 4px !important;
 }
 
-/* Ensure generic black boxes (like those in lineage summary) are forced light */
 [style*="background-color: black"], [style*="background: black"], .bg-black {
     background-color: #f1f3f4 !important;
     color: #202124 !important;
 }
 
-/* Tab Active Highlights */
 .tabs .tabitem.selected, .tabs button.selected {
     border-bottom: 3px solid #1a73e8 !important;
     color: #1a73e8 !important;
@@ -544,7 +247,6 @@ tr, .gr-table tr, .dataframe tr {
     box-shadow: none !important;
 }
 
-/* Metric Cards */
 .gcp-metric-card {
     background: white !important;
     border: 1px solid #dadce0 !important;
@@ -568,13 +270,239 @@ tr, .gr-table tr, .dataframe tr {
 </style>
 """
 
+def analyze_and_preview(project_id, location, dataset_id, target_table, request: gr.Request = None):
+    token = get_token_from_session(request)
+    set_oauth_token(token)
+    try:
+        plugin = get_plugin(project_id, location)
+        summary = plugin.get_lineage_summary(dataset_id, target_table)
+        df = plugin.preview_propagation(dataset_id, target_table)
+        if df.empty:
+            gr.Warning(f"No upstream candidates found for {target_table}.")
+            return summary, pd.DataFrame(columns=["Select", "Target Column", "Source", "Source Column", "Confidence", "Proposed Description", "Type"])
+        df.insert(0, "Select", [True] * len(df))
+        return summary, df
+    except Exception as e:
+        logger.error(f"Analyze & Preview failed: {e}")
+        if "Not found" in str(e) or "404" in str(e):
+            raise gr.Error(f"Table '{target_table}' does not exist in dataset '{dataset_id}'.")
+        raise gr.Error(f"Operation failed: {str(e)}")
+
+def apply_propagation_improved(project_id, location, dataset_id, target_table, candidates_df, request: gr.Request = None):
+    token = get_token_from_session(request)
+    set_oauth_token(token)
+    try:
+        if candidates_df is None or candidates_df.empty:
+            raise gr.Error("No candidates to apply.")
+        candidates_df["Select"] = candidates_df["Select"].astype(bool)
+        selected = candidates_df[candidates_df["Select"] == True]
+        logger.info(f"Applying propagation: {len(selected)} selected rows out of {len(candidates_df)}")
+        if selected.empty:
+            gr.Warning("No columns selected for application.")
+            return "No columns selected."
+        plugin = get_plugin(project_id, location)
+        updates = []
+        for _, row in selected.iterrows():
+            if 'Target Column' in row and 'Proposed Description' in row:
+                updates.append({
+                    "table": target_table,
+                    "column": row['Target Column'],
+                    "description": row['Proposed Description']
+                })
+        if not updates:
+            return "No valid updates found in selection."
+        plugin.apply_propagation(dataset_id, updates)
+        return f"Successfully applied {len(updates)} updates to {target_table}!"
+    except Exception as e:
+        logger.error(f"Apply failed: {e}")
+        raise gr.Error(f"Apply failed: {str(e)}")
+
+def select_all_lineage(df):
+    if df is not None and not df.empty:
+        df = df.copy()
+        df["Select"] = [True] * len(df)
+    return df
+
+def deselect_all_lineage(df):
+    if df is not None and not df.empty:
+        df = df.copy()
+        df["Select"] = [False] * len(df)
+    return df
+
+def get_glossary_recommendations(project_id, location, dataset_id, table_id, request: gr.Request = None):
+    token = get_token_from_session(request)
+    set_oauth_token(token)
+    try:
+        plugin = GlossaryPlugin(project_id, location)
+        df = plugin.recommend_terms_for_table(dataset_id, table_id)
+        if df.empty:
+            gr.Info(f"No glossary recommendations found for {table_id}.")
+            return pd.DataFrame(columns=["Select", "Column", "Suggested Term", "Confidence", "Rationale", "Term ID"])
+        df.insert(0, "Select", [True] * len(df))
+        return df
+    except Exception as e:
+        logger.error(f"Glossary recommendations failed: {e}")
+        raise gr.Error(f"Operation failed: {str(e)}")
+
+def apply_glossary_selections(project_id, location, dataset_id, table_id, reco_df, request: gr.Request = None):
+    token = get_token_from_session(request)
+    set_oauth_token(token)
+    try:
+        if reco_df is None or reco_df.empty:
+            raise gr.Error("No recommendations to apply.")
+        reco_df["Select"] = reco_df["Select"].astype(bool)
+        selected = reco_df[reco_df["Select"] == True]
+        if selected.empty:
+            gr.Warning("No terms selected for application.")
+            return "No terms selected."
+        plugin = GlossaryPlugin(project_id, location)
+        updates = []
+        for _, row in selected.iterrows():
+            updates.append({
+                "column": row['Column'],
+                "term_id": row['Term ID'],
+                "term_display": row['Suggested Term']
+            })
+        plugin.apply_terms(dataset_id, table_id, updates)
+        return f"Successfully applied {len(updates)} glossary terms to {table_id} in Dataplex!"
+    except Exception as e:
+        logger.error(f"Glossary apply failed: {e}")
+        raise gr.Error(f"Apply failed: {str(e)}")
+
+def select_all_glossary(df):
+    if df is not None and not df.empty:
+        df = df.copy()
+        df["Select"] = [True] * len(df)
+    return df
+
+def deselect_all_glossary(df):
+    if df is not None and not df.empty:
+        df = df.copy()
+        df["Select"] = [False] * len(df)
+    return df
+
+def get_policy_tag_recommendations(project_id, location, dataset_id, table_id, request: gr.Request = None):
+    token = get_token_from_session(request)
+    set_oauth_token(token)
+    try:
+        plugin = PolicyTagPlugin(project_id, location)
+        df = plugin.preview_policy_tag_propagation(dataset_id, table_id)
+        if df.empty:
+            gr.Info(f"No policy tag recommendations found for {table_id}.")
+            return pd.DataFrame(columns=["Select", "Target Column", "Source Table", "Policy Tags", "Recommendation", "Logic", "Access Summary"])
+        df.insert(0, "Select", [True] * len(df))
+        return df
+    except Exception as e:
+        logger.error(f"Policy tag recommendations failed: {e}")
+        raise gr.Error(f"Operation failed: {str(e)}")
+
+def apply_policy_tag_recommendations(project_id, location, dataset_id, target_table, recommendations_df, additional_readers, request: gr.Request = None):
+    token = get_token_from_session(request)
+    set_oauth_token(token)
+    try:
+        if recommendations_df is None or recommendations_df.empty:
+            raise gr.Error("No recommendations to apply.")
+        recommendations_df["Select"] = recommendations_df["Select"].astype(bool)
+        selected = recommendations_df[recommendations_df["Select"] == True]
+        if selected.empty:
+            gr.Warning("No columns selected for application.")
+            return "No columns selected."
+        plugin = PolicyTagPlugin(project_id, location)
+        updates = []
+        for _, row in selected.iterrows():
+            update = {
+                "table": target_table,
+                "column": row['Target Column'],
+                "policy_tag": row['Policy Tags'].split(", ")[0]
+            }
+            all_readers = []
+            if additional_readers:
+                all_readers.extend([r.strip() for r in additional_readers.split(",") if r.strip()])
+            if all_readers:
+                update["readers"] = list(set(all_readers))
+            updates.append(update)
+        plugin.apply_policy_tags(dataset_id, updates)
+        return f"Successfully applied {len(updates)} policy tags to {target_table}!"
+    except Exception as e:
+        logger.error(f"Policy tag apply failed: {e}")
+        raise gr.Error(f"Apply failed: {str(e)}")
+
+def select_all_policy(df):
+    if df is not None and not df.empty:
+        df = df.copy()
+        df["Select"] = [True] * len(df)
+    return df
+
+def deselect_all_policy(df):
+    if df is not None and not df.empty:
+        df = df.copy()
+        df["Select"] = [False] * len(df)
+    return df
+
+def get_dq_propagation(project_id, location, dataset_id, table_id, request: gr.Request = None):
+    token = get_token_from_session(request)
+    set_oauth_token(token)
+    try:
+        dq_plugin = DQPlugin(project_id, location)
+        engine = DQPropagationEngine(project_id, location, token=token)
+        target_fqn = f"bigquery:{project_id}.{dataset_id}.{table_id}"
+        from google.cloud import bigquery
+        from context import get_credentials
+        client = bigquery.Client(project=project_id, credentials=get_credentials(project_id))
+        table = client.get_table(f"{project_id}.{dataset_id}.{table_id}")
+        columns = [f.name for f in table.schema]
+        propagation_data = engine.propagate_dq_scores(target_fqn, dataset_id, table_id, columns)
+        results = []
+        for col in columns:
+            data = propagation_data.get(col, {})
+            leaves = data.get("leaves", [])
+            bonus = data.get("bonus", 0.0)
+            if leaves:
+                best_conf = max(leaf.get('confidence', 0) for leaf in leaves)
+                leaves = [leaf for leaf in leaves if leaf.get('confidence', 0) >= best_conf]
+            upstream_scores = []
+            source_names = []
+            for leaf in leaves:
+                src_parts = leaf['source_entity'].split('.')
+                if len(src_parts) == 3:
+                    s_ds, s_tab = src_parts[1], src_parts[2]
+                    s_summary = dq_plugin.fetch_dq_summary(s_ds, s_tab, leaf.get('source_column'))
+                    upstream_scores.append(s_summary['score'])
+                    source_names.append(f"{s_tab}.{leaf.get('source_column')}")
+            if not upstream_scores:
+                summary = dq_plugin.fetch_dq_summary(dataset_id, table_id, col)
+                base_score = summary['score']
+                source_type = summary['source']
+            else:
+                base_score = engine.aggregate_scores(upstream_scores)
+                source_type = "DERIVED"
+            final_score = min(base_score + bonus, 1.0)
+            engine.update_history(target_fqn, col, final_score, source_type=source_type)
+            trend = engine.get_trend(target_fqn, col)
+            badge = "🟢 High" if final_score > 0.9 else ("🟡 Medium" if final_score > 0.7 else "🔴 Low")
+            if bonus > 0:
+                if base_score >= 1.0:
+                    bonus_str = f"+{int(bonus*100)}% (Capped)"
+                else:
+                    bonus_str = f"+{int(bonus*100)}%"
+            else:
+                bonus_str = "None"
+            results.append({
+                "Column": col,
+                "Trust Score": round(final_score, 2),
+                "Badge": badge,
+                "Trend": trend.capitalize(),
+                "Bonus (Remediation)": bonus_str,
+                "Upstream Sources": ", ".join(source_names[:2]) + ("..." if len(source_names) > 2 else "") or "None (Source)"
+            })
+        return pd.DataFrame(results)
+    except Exception as e:
+        logger.error(f"DQ propagation failed: {e}")
+        raise gr.Error(f"Operation failed: {str(e)}")
+
 with gr.Blocks(title="Dataplex Data Steward") as demo:
-    # Force Inject CSS
     gr.HTML(GCP_CSS)
     
-    # App Content
-    
-    # 1. Login View
     with gr.Column(visible=True) as login_view:
         with gr.Column(elem_classes=["gcp-card"]):
             gr.Markdown("# Welcome to Dataplex Data Steward")
@@ -584,7 +512,6 @@ with gr.Blocks(title="Dataplex Data Steward") as demo:
                 fn=None, js="() => window.location.href='/google_login'"
             )
 
-    # 2. Main App View
     with gr.Column(visible=False) as app_view:
         with gr.Row():
             with gr.Column(scale=8):
@@ -598,245 +525,246 @@ with gr.Blocks(title="Dataplex Data Steward") as demo:
                 config_project = gr.Textbox(label="Project ID", value=DEFAULT_PROJECT_ID)
                 config_location = gr.Textbox(label="Location", value=DEFAULT_LOCATION)
     
-    with gr.Tabs():
-        with gr.TabItem("Dashboard"):
-            with gr.Column(elem_classes=["gcp-card"]):
-                gr.Markdown("## 📋 Data Estate Governance")
-                with gr.Group():
+        with gr.Tabs():
+            with gr.TabItem("Dashboard"):
+                with gr.Column(elem_classes=["gcp-card"]):
+                    gr.Markdown("## 📋 Data Estate Governance")
+                    with gr.Group():
+                        with gr.Row():
+                            global_dataset = gr.Textbox(
+                                label="Active Dataset ID", 
+                                value=DEFAULT_DATASET_ID,
+                                placeholder="e.g. retail_synthetic_data",
+                                info="Select a dataset to scan for gaps in descriptions and glossary mappings."
+                            )
+                    
                     with gr.Row():
-                        global_dataset = gr.Textbox(
-                            label="Active Dataset ID", 
-                            value=DEFAULT_DATASET_ID,
-                            placeholder="e.g. retail_synthetic_data",
-                            info="Select a dataset to scan for gaps in descriptions and glossary mappings."
+                        scan_btn = gr.Button("Analyze Governance Health", variant="primary", elem_classes=["gr-button-primary"])
+                    
+                    dash_summary = gr.Markdown("Enter a dataset and click 'Analyze' to view the current governance state.")
+                
+                with gr.Row():
+                    with gr.Column(elem_classes=["gcp-metric-card"]):
+                        desc_metric = gr.HTML("<div class='gcp-metric-value'>-</div><div class='gcp-metric-label'>Description Gaps</div>")
+                    with gr.Column(elem_classes=["gcp-metric-card"]):
+                        gloss_metric = gr.HTML("<div class='gcp-metric-value'>-</div><div class='gcp-metric-label'>Glossary Gaps</div>")
+                    with gr.Column(elem_classes=["gcp-metric-card"]):
+                        orphan_metric = gr.HTML("<div class='gcp-metric-value'>-</div><div class='gcp-metric-label'>Orphaned Columns</div>")
+
+                with gr.Row():
+                    with gr.Column(elem_classes=["gcp-card"]):
+                        gr.Markdown("### 🔍 Technical Description Gaps")
+                        desc_output = gr.Dataframe(
+                            headers=["Table", "Missing Descriptions"],
+                            interactive=False,
+                            wrap=True
+                        )
+                    with gr.Column(elem_classes=["gcp-card"]):
+                        gr.Markdown("### 📖 Business Glossary Gaps")
+                        glossary_gap_output = gr.Dataframe(
+                            headers=["Table", "Missing Glossary Mappings"],
+                            interactive=False,
+                            wrap=True
+                        )
+                    with gr.Column(elem_classes=["gcp-card"]):
+                        gr.Markdown("### ⚠️ Orphaned Assets")
+                        gr.Markdown("<small>Columns missing both description and glossary mapping.</small>")
+                        orphan_output = gr.Dataframe(
+                            headers=["Table", "Orphaned Columns"],
+                            interactive=False,
+                            wrap=True
                         )
                 
-                with gr.Row():
-                    scan_btn = gr.Button("Analyze Governance Health", variant="primary", elem_classes=["gr-button-primary"])
-                
-                dash_summary = gr.Markdown("Enter a dataset and click 'Analyze' to view the current governance state.")
-            
-            # Metric Row
-            with gr.Row():
-                with gr.Column(elem_classes=["gcp-metric-card"]):
-                    desc_metric = gr.HTML("<div class='gcp-metric-value'>-</div><div class='gcp-metric-label'>Description Gaps</div>")
-                with gr.Column(elem_classes=["gcp-metric-card"]):
-                    gloss_metric = gr.HTML("<div class='gcp-metric-value'>-</div><div class='gcp-metric-label'>Glossary Gaps</div>")
-                with gr.Column(elem_classes=["gcp-metric-card"]):
-                    orphan_metric = gr.HTML("<div class='gcp-metric-value'>-</div><div class='gcp-metric-label'>Orphaned Columns</div>")
+                def dashboard_scan_wrapper(project, loc, ds, request: gr.Request):
+                    summary, d_agg, g_agg, o_agg, d_cnt, g_cnt, o_cnt = scan_dataset(project, loc, ds, request)
+                    
+                    d_html = f"<div class='gcp-metric-value'>{d_cnt}</div><div class='gcp-metric-label'>Description Gaps</div>"
+                    g_html = f"<div class='gcp-metric-value'>{g_cnt}</div><div class='gcp-metric-label'>Glossary Gaps</div>"
+                    o_html = f"<div class='gcp-metric-value'>{o_cnt}</div><div class='gcp-metric-label'>Orphaned Columns</div>"
+                    
+                    return summary, d_agg, g_agg, o_agg, d_html, g_html, o_html
 
-            with gr.Row():
+                scan_btn.click(
+                    dashboard_scan_wrapper, 
+                    inputs=[config_project, config_location, global_dataset], 
+                    outputs=[dash_summary, desc_output, glossary_gap_output, orphan_output, desc_metric, gloss_metric, orphan_metric]
+                )
+
+            with gr.TabItem("Description Propagation"):
                 with gr.Column(elem_classes=["gcp-card"]):
-                    gr.Markdown("### 🔍 Technical Description Gaps")
-                    desc_output = gr.Dataframe(
-                        headers=["Table", "Missing Descriptions"],
+                    gr.Markdown("## 🧬 Analyze & Propagate Descriptions")
+                    with gr.Row():
+                        prop_table = gr.Textbox(label="Target Table", value="transactions")
+                    
+                    preview_btn = gr.Button("Analyze & Preview Description Propagation", variant="primary", elem_classes=["gr-button-primary"])
+                    
+                    summary_output = gr.Markdown("Enter a table and click the button above to start analysis.")
+                    gr.Markdown("*(Optional: Click any cell in the **Proposed Description** column to refine it before applying)*")
+                    preview_output = gr.Dataframe(
+                        label="Propagation Candidates", 
+                        interactive=True, 
+                        wrap=True,
+                        datatype=["bool", "str", "str", "str", "number", "str", "str"]
+                    )
+                    
+                    with gr.Row():
+                        select_all_lineage_btn = gr.Button("Select All", size="sm", elem_classes=["gr-button-secondary"])
+                        deselect_all_lineage_btn = gr.Button("Deselect All", size="sm", elem_classes=["gr-button-secondary"])
+                    
+                    with gr.Row():
+                        apply_btn = gr.Button("Apply Selection to BigQuery", variant="primary", elem_classes=["gr-button-primary"])
+                    
+                    apply_result = gr.Textbox(label="Apply Status", interactive=False)
+
+                select_all_lineage_btn.click(select_all_lineage, inputs=[preview_output], outputs=[preview_output])
+                deselect_all_lineage_btn.click(deselect_all_lineage, inputs=[preview_output], outputs=[preview_output])
+                
+                preview_btn.click(
+                    lambda: "", outputs=[apply_result]
+                ).then(
+                    analyze_and_preview, 
+                    inputs=[config_project, config_location, global_dataset, prop_table], 
+                    outputs=[summary_output, preview_output]
+                )
+                apply_btn.click(
+                    apply_propagation_improved, 
+                    inputs=[config_project, config_location, global_dataset, prop_table, preview_output], 
+                    outputs=apply_result
+                )
+
+            with gr.TabItem("Glossary Recommendations"):
+                with gr.Column(elem_classes=["gcp-card"]):
+                    gr.Markdown("## 📖 Business Glossary Mapping")
+                    gr.Markdown("Recommends mappings of columns to business glossary terms across tables.")
+                    
+                    with gr.Row():
+                        glossary_table = gr.Textbox(label="Target Table", value="customers")
+                    
+                    recommend_btn = gr.Button("Get Glossary Recommendations", variant="primary", elem_classes=["gr-button-primary"])
+                
+                with gr.Column(elem_classes=["gcp-card"]):
+                    recommendations_view = gr.Dataframe(
+                        label="Glossary Recommendations",
+                        interactive=True,
+                        wrap=True,
+                        datatype=["bool", "str", "str", "number", "str", "str"]
+                    )
+                    
+                    with gr.Row():
+                        select_all_glossary_btn = gr.Button("Select All", size="sm", elem_classes=["gr-button-secondary"])
+                        deselect_all_glossary_btn = gr.Button("Deselect All", size="sm", elem_classes=["gr-button-secondary"])
+                    
+                    with gr.Row():
+                        apply_glossary_btn = gr.Button("Apply Selected Terms to Dataplex", variant="primary", elem_classes=["gr-button-primary"])
+                    
+                    glossary_apply_result = gr.Textbox(label="Apply Status", interactive=False)
+
+                select_all_glossary_btn.click(select_all_glossary, inputs=[recommendations_view], outputs=[recommendations_view])
+                deselect_all_glossary_btn.click(deselect_all_glossary, inputs=[recommendations_view], outputs=[recommendations_view])
+                
+                recommend_btn.click(
+                    lambda: "", outputs=[glossary_apply_result]
+                ).then(
+                    get_glossary_recommendations,
+                    inputs=[config_project, config_location, global_dataset, glossary_table],
+                    outputs=recommendations_view
+                )
+                
+                apply_glossary_btn.click(
+                    apply_glossary_selections,
+                    inputs=[config_project, config_location, global_dataset, glossary_table, recommendations_view],
+                    outputs=glossary_apply_result
+                )
+
+            with gr.TabItem("Policy Tag Propagation"):
+                with gr.Column(elem_classes=["gcp-card"]):
+                    gr.Markdown("## 🛡️ Policy Tag Propagation")
+                    gr.Markdown("Recommends propagating policy tags based on lineage and transformation assessment.")
+                    
+                    with gr.Row():
+                        policy_table = gr.Textbox(label="Target Table", value="customers")
+                    
+                    policy_recommend_btn = gr.Button("Get Policy Tag Recommendations", variant="primary", elem_classes=["gr-button-primary"])
+                
+                with gr.Column(elem_classes=["gcp-card"]):
+                    policy_recommendations_view = gr.Dataframe(
+                        label="Policy Tag Recommendations",
+                        interactive=True,
+                        wrap=True,
+                        datatype=["bool", "str", "str", "str", "str", "str", "str"]
+                    )
+                    
+                    with gr.Row():
+                        additional_readers_txt = gr.Textbox(label="Additional Readers to add (Comma separated)", placeholder="group:data-scientists@example.com, user:analyst@example.com")
+                    
+                    with gr.Row():
+                        select_all_policy_btn = gr.Button("Select All", size="sm", elem_classes=["gr-button-secondary"])
+                        deselect_all_policy_btn = gr.Button("Deselect All", size="sm", elem_classes=["gr-button-secondary"])
+                    
+                    with gr.Row():
+                        apply_policy_btn = gr.Button("Apply Selected Tags to BigQuery", variant="primary", elem_classes=["gr-button-primary"])
+                    
+                    policy_apply_result = gr.Textbox(label="Apply Status", interactive=False)
+
+                select_all_policy_btn.click(select_all_policy, inputs=[policy_recommendations_view], outputs=[policy_recommendations_view])
+                deselect_all_policy_btn.click(deselect_all_policy, inputs=[policy_recommendations_view], outputs=[policy_recommendations_view])
+                
+                policy_recommend_btn.click(
+                    lambda: "", outputs=[policy_apply_result]
+                ).then(
+                    get_policy_tag_recommendations,
+                    inputs=[config_project, config_location, global_dataset, policy_table],
+                    outputs=policy_recommendations_view
+                )
+
+                apply_policy_btn.click(
+                    apply_policy_tag_recommendations,
+                    inputs=[config_project, config_location, global_dataset, policy_table, policy_recommendations_view, additional_readers_txt],
+                    outputs=policy_apply_result
+                )
+
+            with gr.TabItem("Trust Center (DQ)"):
+                with gr.Column(elem_classes=["gcp-card"]):
+                    gr.Markdown("## 💎 Data Trust & Quality Propagation")
+                    gr.Markdown("Visualizes derived trust scores for tables and views based on upstream quality and transformation logic.")
+                    
+                    with gr.Row():
+                        dq_table = gr.Textbox(label="Target Table/View", value="transactions")
+                    
+                    dq_analyze_btn = gr.Button("Analyze Trust & Quality", variant="primary", elem_classes=["gr-button-primary"])
+                
+                with gr.Column(elem_classes=["gcp-card"]):
+                    dq_results_view = gr.Dataframe(
+                        label="Column Trust Metrics",
                         interactive=False,
                         wrap=True
                     )
-                with gr.Column(elem_classes=["gcp-card"]):
-                    gr.Markdown("### 📖 Business Glossary Gaps")
-                    glossary_gap_output = gr.Dataframe(
-                        headers=["Table", "Missing Glossary Mappings"],
-                        interactive=False,
-                        wrap=True
-                    )
-                with gr.Column(elem_classes=["gcp-card"]):
-                    gr.Markdown("### ⚠️ Orphaned Assets")
-                    gr.Markdown("<small>Columns missing both description and glossary mapping.</small>")
-                    orphan_output = gr.Dataframe(
-                        headers=["Table", "Orphaned Columns"],
-                        interactive=False,
-                        wrap=True
-                    )
-            
-            def dashboard_scan_wrapper(project, loc, ds, request: gr.Request):
-                summary, d_agg, g_agg, o_agg, d_cnt, g_cnt, o_cnt = scan_dataset(project, loc, ds, request)
-                
-                # Format metrics
-                d_html = f"<div class='gcp-metric-value'>{d_cnt}</div><div class='gcp-metric-label'>Description Gaps</div>"
-                g_html = f"<div class='gcp-metric-value'>{g_cnt}</div><div class='gcp-metric-label'>Glossary Gaps</div>"
-                o_html = f"<div class='gcp-metric-value'>{o_cnt}</div><div class='gcp-metric-label'>Orphaned Columns</div>"
-                
-                return summary, d_agg, g_agg, o_agg, d_html, g_html, o_html
+                    
+                    gr.Markdown("### 💡 Trust Logic")
+                    gr.Markdown("- **Conservative Scoring**: Minimum quality of all upstream contributors.\n- **Remediation Bonus**: Automatic detection of `DISTINCT` or `COALESCE` improves the derived score.\n- **Trend Analysis**: Compares current score against the last 5 snapshots.")
 
-            scan_btn.click(
-                dashboard_scan_wrapper, 
-                inputs=[config_project, config_location, global_dataset], 
-                outputs=[dash_summary, desc_output, glossary_gap_output, orphan_output, desc_metric, gloss_metric, orphan_metric]
-            )
-
-        with gr.TabItem("Description Propagation"):
-            with gr.Column(elem_classes=["gcp-card"]):
-                gr.Markdown("## 🧬 Analyze & Propagate Descriptions")
-                with gr.Row():
-                    prop_table = gr.Textbox(label="Target Table", value="transactions")
-                
-                preview_btn = gr.Button("Analyze & Preview Description Propagation", variant="primary", elem_classes=["gr-button-primary"])
-                
-                summary_output = gr.Markdown("Enter a table and click the button above to start analysis.")
-                gr.Markdown("*(Optional: Click any cell in the **Proposed Description** column to refine it before applying)*")
-                preview_output = gr.Dataframe(
-                    label="Propagation Candidates", 
-                    interactive=True, 
-                    wrap=True,
-                    datatype=["bool", "str", "str", "str", "number", "str", "str"]
+                dq_analyze_btn.click(
+                    get_dq_propagation,
+                    inputs=[config_project, config_location, global_dataset, dq_table],
+                    outputs=dq_results_view
                 )
-                
-                with gr.Row():
-                    select_all_lineage_btn = gr.Button("Select All", size="sm", elem_classes=["gr-button-secondary"])
-                    deselect_all_lineage_btn = gr.Button("Deselect All", size="sm", elem_classes=["gr-button-secondary"])
-                
-                with gr.Row():
-                    apply_btn = gr.Button("Apply Selection to BigQuery", variant="primary", elem_classes=["gr-button-primary"])
-                
-                apply_result = gr.Textbox(label="Apply Status", interactive=False)
 
-            select_all_lineage_btn.click(select_all_lineage, inputs=[preview_output], outputs=[preview_output])
-            deselect_all_lineage_btn.click(deselect_all_lineage, inputs=[preview_output], outputs=[preview_output])
-            
-            preview_btn.click(
-                lambda: "", outputs=[apply_result]
-            ).then(
-                analyze_and_preview, 
-                inputs=[config_project, config_location, global_dataset, prop_table], 
-                outputs=[summary_output, preview_output]
-            )
-            apply_btn.click(
-                apply_propagation_improved, 
-                inputs=[config_project, config_location, global_dataset, prop_table, preview_output], 
-                outputs=apply_result
-            )
+    # Helper to check auth status
+    def check_auth_status(request: gr.Request):
+        if request and "google_token" in request.session:
+            return gr.update(visible=False), gr.update(visible=True)
+        return gr.update(visible=True), gr.update(visible=False)
 
-        with gr.TabItem("Glossary Recommendations"):
-            with gr.Column(elem_classes=["gcp-card"]):
-                gr.Markdown("## 📖 Business Glossary Mapping")
-                gr.Markdown("Recommends mappings of columns to business glossary terms across tables.")
-                
-                with gr.Row():
-                    glossary_table = gr.Textbox(label="Target Table", value="customers")
-                
-                recommend_btn = gr.Button("Get Glossary Recommendations", variant="primary", elem_classes=["gr-button-primary"])
-            
-            with gr.Column(elem_classes=["gcp-card"]):
-                recommendations_view = gr.Dataframe(
-                    label="Glossary Recommendations",
-                    interactive=True,
-                    wrap=True,
-                    datatype=["bool", "str", "str", "number", "str", "str"]
-                )
-                
-                with gr.Row():
-                    select_all_glossary_btn = gr.Button("Select All", size="sm", elem_classes=["gr-button-secondary"])
-                    deselect_all_glossary_btn = gr.Button("Deselect All", size="sm", elem_classes=["gr-button-secondary"])
-                
-                with gr.Row():
-                    apply_glossary_btn = gr.Button("Apply Selected Terms to Dataplex", variant="primary", elem_classes=["gr-button-primary"])
-                
-                glossary_apply_result = gr.Textbox(label="Apply Status", interactive=False)
-
-            select_all_glossary_btn.click(select_all_glossary, inputs=[recommendations_view], outputs=[recommendations_view])
-            deselect_all_glossary_btn.click(deselect_all_glossary, inputs=[recommendations_view], outputs=[recommendations_view])
-            
-            recommend_btn.click(
-                lambda: "", outputs=[glossary_apply_result]
-            ).then(
-                get_glossary_recommendations,
-                inputs=[config_project, config_location, global_dataset, glossary_table],
-                outputs=recommendations_view
-            )
-            
-            apply_glossary_btn.click(
-                apply_glossary_selections,
-                inputs=[config_project, config_location, global_dataset, glossary_table, recommendations_view],
-                outputs=glossary_apply_result
-            )
-
-        with gr.TabItem("Policy Tag Propagation"):
-            with gr.Column(elem_classes=["gcp-card"]):
-                gr.Markdown("## 🛡️ Policy Tag Propagation")
-                gr.Markdown("Recommends propagating policy tags based on lineage and transformation assessment.")
-                
-                with gr.Row():
-                    policy_table = gr.Textbox(label="Target Table", value="customers")
-                
-                policy_recommend_btn = gr.Button("Get Policy Tag Recommendations", variant="primary", elem_classes=["gr-button-primary"])
-            
-            with gr.Column(elem_classes=["gcp-card"]):
-                policy_recommendations_view = gr.Dataframe(
-                    label="Policy Tag Recommendations",
-                    interactive=True,
-                    wrap=True,
-                    datatype=["bool", "str", "str", "str", "str", "str", "str"]
-                )
-                
-                with gr.Row():
-                    additional_readers_txt = gr.Textbox(label="Additional Readers to add (Comma separated)", placeholder="group:data-scientists@example.com, user:analyst@example.com")
-                
-                with gr.Row():
-                    select_all_policy_btn = gr.Button("Select All", size="sm", elem_classes=["gr-button-secondary"])
-                    deselect_all_policy_btn = gr.Button("Deselect All", size="sm", elem_classes=["gr-button-secondary"])
-                
-                with gr.Row():
-                    apply_policy_btn = gr.Button("Apply Selected Tags to BigQuery", variant="primary", elem_classes=["gr-button-primary"])
-                
-                policy_apply_result = gr.Textbox(label="Apply Status", interactive=False)
-
-            select_all_policy_btn.click(select_all_policy, inputs=[policy_recommendations_view], outputs=[policy_recommendations_view])
-            deselect_all_policy_btn.click(deselect_all_policy, inputs=[policy_recommendations_view], outputs=[policy_recommendations_view])
-            
-            policy_recommend_btn.click(
-                lambda: "", outputs=[policy_apply_result]
-            ).then(
-                get_policy_tag_recommendations,
-                inputs=[config_project, config_location, global_dataset, policy_table],
-                outputs=policy_recommendations_view
-            )
-
-            apply_policy_btn.click(
-                apply_policy_tag_recommendations,
-                inputs=[config_project, config_location, global_dataset, policy_table, policy_recommendations_view, additional_readers_txt],
-                outputs=policy_apply_result
-            )
-
-        with gr.TabItem("Trust Center (DQ)"):
-            with gr.Column(elem_classes=["gcp-card"]):
-                gr.Markdown("## 💎 Data Trust & Quality Propagation")
-                gr.Markdown("Visualizes derived trust scores for tables and views based on upstream quality and transformation logic.")
-                
-                with gr.Row():
-                    dq_table = gr.Textbox(label="Target Table/View", value="transactions")
-                
-                dq_analyze_btn = gr.Button("Analyze Trust & Quality", variant="primary", elem_classes=["gr-button-primary"])
-            
-            with gr.Column(elem_classes=["gcp-card"]):
-                dq_results_view = gr.Dataframe(
-                    label="Column Trust Metrics",
-                    interactive=False,
-                    wrap=True
-                )
-                
-                gr.Markdown("### 💡 Trust Logic")
-                gr.Markdown("- **Conservative Scoring**: Minimum quality of all upstream contributors.\n- **Remediation Bonus**: Automatic detection of `DISTINCT` or `COALESCE` improves the derived score.\n- **Trend Analysis**: Compares current score against the last 5 snapshots.")
-
-            dq_analyze_btn.click(
-                get_dq_propagation,
-                inputs=[config_project, config_location, global_dataset, dq_table],
-                outputs=dq_results_view
-            )
-
-    # Auth logic: Show info on load if already logged in
     demo.load(check_auth_status, outputs=[login_view, app_view])
 
 if __name__ == "__main__":
     from fastapi import FastAPI
     main_app = FastAPI()
     
-    # Add Session Middleware with a custom cookie name to prevent collisions
     main_app.add_middleware(SessionMiddleware, secret_key="some-secret-key-for-auth-propagation", session_cookie="steward_session")
 
     @main_app.get("/google_login")
     async def login(request: fastapi.Request):
-        # Allow override from .env if needed, but default to /google_callback
         redirect_uri = os.environ.get("GOOGLE_REDIRECT_URI", "http://localhost:7860/google_callback")
         client_id = os.environ.get("GOOGLE_CLIENT_ID", "")
         logger.info(f"Initiating login: client_id={client_id[:10]}... redirect_uri={redirect_uri}")
@@ -845,7 +773,6 @@ if __name__ == "__main__":
     @main_app.get("/google_callback")
     async def auth_callback(request: fastapi.Request):
         try:
-            # Removed explicit redirect_uri to prevent "multiple values" error
             token = await oauth_config.google.authorize_access_token(request)
             request.session["google_token"] = token
             logger.info("Successfully received token and stored in session.")
@@ -859,7 +786,6 @@ if __name__ == "__main__":
         request.session.pop("google_token", None)
         return RedirectResponse(url="/")
 
-    # Mount Gradio AFTER defining custom routes
     app = gr.mount_gradio_app(main_app, demo, path="/")
 
     import uvicorn

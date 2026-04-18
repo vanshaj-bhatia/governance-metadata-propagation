@@ -225,19 +225,34 @@ class LineagePlugin(BasePlugin):
             for t in targets:
                 downstream_entities.add(t['target_entity'])
         
+        # Fetch schemas for upstream entities to check for descriptions
+        entity_descriptions = {}
+        for ent in upstream_entities:
+            try:
+                clean_ent = ent.replace("bigquery:", "")
+                src_table = client.get_table(clean_ent)
+                entity_descriptions[ent] = {f.name for f in src_table.schema if f.description}
+            except Exception as e:
+                logger.warning(f"Failed to fetch schema for {ent}: {e}")
+                entity_descriptions[ent] = set()
+
         # Generate Summary Text
         summary = f"### Propagation Summary for `{table_id}`\n\n"
         
         if upstream_entities:
             summary += f"**Upstream Sources ({len(upstream_entities)}):**\n"
             for ent in sorted(upstream_entities):
-                # Count columns that have this entity as their PRIMARY (best) source
+                # Count columns that have this entity as their PRIMARY (best) source AND have descriptions
                 cols = []
                 for c, candidates in upstream_map.items():
                     if candidates and candidates[0]['source_entity'] == ent:
-                        cols.append(c)
+                        src_col = candidates[0]['source_column']
+                        if src_col in entity_descriptions.get(ent, set()):
+                            cols.append(c)
                 if cols:
                     summary += f"- `{ent}` (contributes {len(cols)} columns)\n"
+                else:
+                    summary += f"- `{ent}` (contributes 0 columns - missing descriptions upstream)\n"
         else:
             summary += "*No upstream sources found via Data Lineage API.*\n"
             
