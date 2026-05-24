@@ -92,6 +92,9 @@ python3 steward_cli.py scan --dataset retail_syn_data
 # Preview and apply description propagation to a table
 python3 steward_cli.py apply --dataset retail_syn_data --table transactions
 
+# Preview and apply description propagation using Document Context (RAG)
+python3 steward_cli.py apply --dataset retail_syn_data --table transactions --document docs/design.pdf --context-mode rag
+
 # Recommend glossary terms using Vertex AI Semantic Similarity
 python3 steward_cli.py glossary-recommend --dataset retail_syn_data --table transactions
 
@@ -107,6 +110,24 @@ python3 steward_cli.py dq-propagate --dataset retail_syn_data --table customers
 # NEW: End-to-end Dataplex AI Insight propagation (Trigger -> Extract -> Apply)
 # This handles the full scan, wait, and metadata update in one go.
 python3 steward_cli.py dataplex-propagate --dataset retail_syn_data --table transactions --apply
+```
+
+### Document Context Modes
+When using the `--document` flag with the `apply` command, you can specify a `--context-mode` to choose how the document is processed:
+
+*   **`direct` (Context Injection)**: Reads the full text of the document(s) and appends it directly to the Gemini prompt for each column. Best for small documents.
+    ```bash
+    python3 steward_cli.py apply --dataset retail_syn_data --table transactions --document docs/small_doc.txt --context-mode direct
+    ```
+*   **`rag` (In-Memory RAG)**: Chunks the document, generates embeddings, and retrieves the most relevant snippets for each column. Best for large documents to save tokens and improve focus.
+    ```bash
+    python3 steward_cli.py apply --dataset retail_syn_data --table transactions --document docs/large_doc.pdf --context-mode rag
+    ```
+    > 💡 *Note: Vector embeddings are generated remotely using Vertex AI's `text-embedding-004` model and stored locally in-memory for fast similarity search.*
+*   **`datastore` (Managed DataStore)**: Queries a pre-existing Vertex AI Search DataStore. Best for enterprise setups with large document repositories.
+    ```bash
+    python3 steward_cli.py apply --dataset retail_syn_data --table transactions --context-mode datastore --datastore-id my-datastore-id
+    ```
 ```
 
 ### 3. Data Integration Scripts

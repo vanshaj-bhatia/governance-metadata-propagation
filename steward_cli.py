@@ -11,12 +11,18 @@ from dotenv import load_dotenv
 # Load configurations from .env
 load_dotenv(override=True)
 
+import logging
+import tempfile
+
+
+
 try:
     from lineage_plugin import LineagePlugin
     from glossary_plugin import GlossaryPlugin
     from policy_tag_plugin import PolicyTagPlugin
     from dq_plugin import DQPlugin
     from dq_propagation import DQPropagationEngine
+    from doc_description_plugin import DocDescriptionPlugin
     # Import unified insights connector
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), 'dataplex_integration')))
     from insights_connector import DataInsightsClient
@@ -30,6 +36,7 @@ def main():
     parser.add_argument("--project", "--project_id", dest="project", default=os.environ.get("GOOGLE_CLOUD_PROJECT", "governance-agent"), help="GCP Project ID")
     parser.add_argument("--location", default="europe-west1", help="GCP Location")
     parser.add_argument("--yes", "-y", action="store_true", help="Automatically approve all prompts")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging to file")
     
     subparsers = parser.add_subparsers(dest="command", help="Commands")
     
@@ -41,6 +48,10 @@ def main():
     apply_parser = subparsers.add_parser("apply", help="Preview and apply description propagation for a table")
     apply_parser.add_argument("--dataset", "--dataset_id", dest="dataset", required=True, help="BigQuery Dataset ID")
     apply_parser.add_argument("--table", "--table_id", dest="table", required=True, help="BigQuery Table ID")
+    # Document context options for description propagation
+    apply_parser.add_argument("--document", nargs="+", help="Path to unstructured document(s) to influence descriptions")
+    apply_parser.add_argument("--context-mode", choices=["direct", "rag", "datastore"], default="rag", help="Mode to process document context")
+    apply_parser.add_argument("--datastore-id", help="Vertex AI Search DataStore ID (required for datastore mode)")
     
     # Glossary recommend command
     glossary_parser = subparsers.add_parser("glossary-recommend", help="Recommend glossary terms for a table")
@@ -71,9 +82,37 @@ def main():
     
     args = parser.parse_args()
     
+    # Configure logging based on debug flag
+    log_file_path = None
+    if args.debug:
+        log_file = tempfile.NamedTemporaryFile(delete=False, prefix='steward_', suffix='.log')
+        log_file_path = log_file.name
+        log_file.close()
+        print(f"Logging detailed execution to: {log_file_path}")
+        
+    root_logger = logging.getLogger()
+    # Clear existing handlers to prevent double printing
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+        
+    root_logger.setLevel(logging.DEBUG if args.debug else logging.INFO)
+    
+    # Only log to file if debug is enabled to avoid filling up disk
+    if args.debug:
+        fh = logging.FileHandler(log_file_path)
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        root_logger.addHandler(fh)
+        
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    root_logger.addHandler(ch)
+    
     plugin = LineagePlugin(args.project, args.location)
     glossary_plugin = GlossaryPlugin(args.project, args.location)
     policy_plugin = PolicyTagPlugin(args.project, args.location)
+    doc_plugin = DocDescriptionPlugin(args.project, args.location)
     
     if args.command == "scan":
         print(f"Scanning dataset '{args.dataset}' in project '{args.project}'...")
@@ -85,8 +124,26 @@ def main():
             print(df.to_string(index=False))
             
     elif args.command == "apply":
+        if args.context_mode == "datastore":
+            if not args.datastore_id:
+                print("Error: --datastore-id is required when --context-mode is 'datastore'")
+                sys.exit(1)
+            if args.datastore_id.startswith("https://"):
+                print("Error: Invalid --datastore-id format.")
+                print("Expected formats:")
+                print("  1. Short ID: e.g., 'my-datastore-id'")
+                print("  2. Full Resource Path: e.g., 'projects/my-project/locations/global/collections/default_collection/dataStores/my-datastore-id'")
+                print("Do not provide the full API URL starting with https://")
+                sys.exit(1)
+                
         print(f"Analyzing lineage for '{args.dataset}.{args.table}'...")
-        df = plugin.preview_propagation(args.dataset, args.table)
+        df = plugin.preview_propagation(
+            args.dataset, 
+            args.table, 
+            document_path=args.document, 
+            context_mode=args.context_mode, 
+            datastore_id=args.datastore_id
+        )
         
         if df.empty:
             print("No propagation candidates found.")
@@ -293,6 +350,9 @@ def main():
     else:
 
         parser.print_help()
+
+    if args.debug:
+        print(f"\nℹ️ Detailed execution logs (including DEBUG level) are available at: {log_file_path}")
 
 if __name__ == "__main__":
     main()

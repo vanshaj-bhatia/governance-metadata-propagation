@@ -42,17 +42,23 @@ class VertexAIEmbedder:
         if not client or not texts:
             return []
             
+        all_embeddings = []
+        # Batching to avoid token limit errors (e.g., 20k tokens limit)
+        batch_size = 50
+        
         try:
-            # google-genai SDK handles batching via the contents list
-            response = client.models.embed_content(
-                model=self.model_name,
-                contents=texts,
-                config=types.EmbedContentConfig(
-                    task_type=task_type
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i:i + batch_size]
+                logger.info(f"Generating embeddings for batch {i//batch_size + 1} (size {len(batch)})...")
+                response = client.models.embed_content(
+                    model=self.model_name,
+                    contents=batch,
+                    config=types.EmbedContentConfig(
+                        task_type=task_type
+                    )
                 )
-            )
-            # The response contains a list of embeddings
-            return [e.values for e in response.embeddings]
+                all_embeddings.extend([e.values for e in response.embeddings])
+            return all_embeddings
         except Exception as e:
             logger.error(f"Error generating embeddings with Google Gen AI SDK: {e}")
             return []

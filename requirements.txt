@@ -1,4 +1,4 @@
-gradio[oauth]==4.44.0
+gradio[oauth]
 requests
 google-cloud-dataplex
 google-cloud-bigquery
@@ -18,3 +18,4 @@ google-cloud-aiplatform
 google-genai
 google-cloud-bigquery-datapolicies
 google-cloud-recommender
+pyOpenSSL
