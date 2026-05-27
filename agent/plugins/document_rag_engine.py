@@ -126,9 +126,9 @@ class DocumentRAGEngine:
                     "table definitions, column descriptions, business glossary terms, and data classification/policy tags. "
                     "Ignore all other information such as infrastructure setup, deployment steps, project background, etc. "
                     "Format the extracted information as clean Markdown using the following rules:\n"
-                    "1. Use `# Table: [Name]` as the ONLY header for a table section. Do NOT use sub-headers (##) inside it.\n"
-                    "2. Use `# Business Glossary` for glossary terms.\n"
-                    "3. Use `# Policy Tags` for classification rules.\n"
+                    "1. Use `# Table: [Name]` as the header for a table section.\n"
+                    "2. Use `# Business Glossary for Table: [Name]` for glossary terms belonging to that table.\n"
+                    "3. Use `# Policy Tags for Table: [Name]` for classification rules belonging to that table.\n"
                     "Use bold text for sub-sections (e.g., **Column Definitions**). "
                     "Do not summarize the content, just extract the relevant parts accurately."
                 ],
@@ -172,12 +172,23 @@ class DocumentRAGEngine:
             if len(chunk) > chunk_size * 2:
                 # Line-aware fallback to avoid breaking words/sentences
                 lines = chunk.split('\n')
+                
+                # Extract header if exists to preserve context across splits
+                header_line = ""
+                if lines and lines[0].startswith('#'):
+                    header_line = lines[0]
+                    lines = lines[1:] # Process remaining lines
+                
                 current_chunk = []
                 current_length = 0
                 
                 for line in lines:
                     if current_length + len(line) > chunk_size and current_chunk:
-                        final_chunks.append('\n'.join(current_chunk))
+                        chunk_content = '\n'.join(current_chunk)
+                        if header_line:
+                            chunk_content = header_line + "\n" + chunk_content
+                        final_chunks.append(chunk_content)
+                        
                         # Handle overlap by keeping lines from the end that fit in chunk_overlap
                         overlap_chunk = []
                         overlap_len = 0
@@ -194,7 +205,10 @@ class DocumentRAGEngine:
                         current_length += len(line) + 1
                         
                 if current_chunk:
-                    final_chunks.append('\n'.join(current_chunk))
+                    chunk_content = '\n'.join(current_chunk)
+                    if header_line:
+                        chunk_content = header_line + "\n" + chunk_content
+                    final_chunks.append(chunk_content)
             else:
                 final_chunks.append(chunk)
                 

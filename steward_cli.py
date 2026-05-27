@@ -68,6 +68,9 @@ def main():
     policy_propagate_parser.add_argument("--apply", action="store_true", help="Apply recommendations directly without confirmation")
     policy_propagate_parser.add_argument("--propagate-access", action="store_true", help="Also propagate Fine-Grained Access Control (IAM) from source tags")
     policy_propagate_parser.add_argument("--readers", help="Comma-separated list of additional readers to add to the policy tags")
+    policy_propagate_parser.add_argument("--document", nargs="+", help="Path to unstructured document(s) (PDF/TXT/MD) for context")
+    policy_propagate_parser.add_argument("--context-mode", choices=["direct", "rag", "datastore"], default="rag", help="Mode for processing document context")
+    policy_propagate_parser.add_argument("--datastore-id", help="Vertex AI Search DataStore ID (required for datastore mode)")
     
     # DQ Propagate command
     dq_propagate_parser = subparsers.add_parser("dq-propagate", help="Analyze and propagate trust/DQ scores for a table or view")
@@ -196,7 +199,13 @@ def main():
  
     elif args.command == "policy-propagate":
         print(f"Analyzing policy tag propagation for '{args.dataset}.{args.table}'...")
-        df = policy_plugin.preview_policy_tag_propagation(args.dataset, args.table)
+        df = policy_plugin.preview_policy_tag_propagation(
+            args.dataset, 
+            args.table, 
+            doc_path=args.document, 
+            context_mode=args.context_mode,
+            datastore_id=args.datastore_id
+        )
         
         if df.empty:
             print("No policy tag propagation recommendations found.")

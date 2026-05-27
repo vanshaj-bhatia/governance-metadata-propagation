@@ -106,6 +106,46 @@ class DocDescriptionPlugin(BasePlugin):
             }
         return None
 
+    def recommend_policy_tag_for_column(self, table_id: str, col_name: str, col_type: str, allowed_tags: List[str]) -> Optional[Dict[str, Any]]:
+        """Recommends a policy tag for a single column based on selected mode (Strict Grounding)."""
+        self._ensure_initialized()
+        
+        logger.info(f"Analyzing Policy Tag for column '{col_name}' in table '{table_id}' using mode '{self.mode}'...")
+        
+        query = f"Table: {table_id}, Column: {col_name} ({col_type})"
+        context = ""
+        top_score = 0.8 # Default fallback
+        
+        if self.mode == "rag":
+            chunks = self._rag_engine.retrieve(query, top_k=5)
+            if chunks:
+                context = "\n---\n".join([c['text'] for c in chunks])
+                top_score = chunks[0]['score']
+                
+        elif self.mode == "direct":
+            if hasattr(self, 'full_text') and self.full_text:
+                context = self.full_text
+                
+        elif self.mode == "datastore":
+            if self.datastore_id:
+                context = self._query_datastore(query)
+                
+        if not context:
+            return None
+            
+        # Generate Policy Tag recommendation via Gemini
+        tag = self._generate_policy_tag_with_context(table_id, col_name, col_type, context, allowed_tags)
+        
+        if tag and tag != "NO_INFO":
+            return {
+                "Target Column": col_name,
+                "Proposed Tag": tag,
+                "Confidence": round(top_score, 2),
+                "Source": f"Document ({self.mode})",
+                "Rationale": f"Extracted explicit tag from {self.mode} document processing"
+            }
+        return None
+
     def _query_datastore(self, query: str) -> str:
         """Queries the Vertex AI Search DataStore using REST API."""
         import requests
@@ -249,18 +289,62 @@ Instructions:
 3. If the documentation does not contain EXPLICIT information for this specific column in the context of table '{table_id}', you MUST reply with "NO_INFO". Do not infer, extrapolate, or assume meanings even if they seem logical.
 4. Focus on the business meaning of the column.
 """
+        logger.debug(f"Gemini Description Prompt:\n{prompt}")
         try:
             response = self._client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-2.5-flash-lite",
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     temperature=0.0
                 )
             )
             text = response.text.strip()
+            logger.debug(f"Gemini Description Response:\n{text}")
             if text == "NO_INFO":
                 return ""
             return text
         except Exception as e:
             logger.error(f"Failed to generate description for {col_name}: {e}")
+            return ""
+
+    def _generate_policy_tag_with_context(self, table_id: str, col_name: str, col_type: str, context: str, allowed_tags: List[str]) -> str:
+        """Calls Gemini to extract policy tags based on context with strict grounding (no inference)."""
+        if not context:
+            logger.warning(f"No context found for column {col_name}")
+            return ""
+            
+        tags_str = ", ".join([f"'{t}'" for t in allowed_tags])
+            
+        prompt = f"""
+You are a Data Steward. Your task is to identify if a database column has an EXPLICIT policy tag or PII classification assigned to it in the provided reference documentation.
+
+Table Name: {table_id}
+Column Name: {col_name}
+Column Type: {col_type}
+
+Reference Documentation:
+{context}
+
+Instructions:
+1. Look for explicit indicators of sensitivity, such as a column explicitly labeled "PII" with value "Y", or a dedicated "Policy Tags" section listing this column.
+2. The documentation might contain information about OTHER tables. You MUST ignore information that does not pertain to the table '{table_id}'.
+3. If the documentation does NOT explicitly label this column as PII or sensitive in the context of table '{table_id}', you MUST reply with "NO_INFO". 
+4. Do NOT infer or guess that a column is PII based on its name (like "Full Name") or description. Only reply with a tag if the document EXPLICITLY states it.
+5. You MUST ONLY choose a tag from this list of allowed tags: [{tags_str}].
+6. Reply with ONLY the exact tag name from the list, or "NO_INFO".
+"""
+        logger.debug(f"Gemini Policy Tag Prompt:\n{prompt}")
+        try:
+            response = self._client.models.generate_content(
+                model="gemini-2.5-flash-lite",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.0
+                )
+            )
+            text = response.text.strip()
+            logger.debug(f"Gemini Policy Tag Response:\n{text}")
+            return text
+        except Exception as e:
+            logger.error(f"Failed to generate policy tag for {col_name}: {e}")
             return ""

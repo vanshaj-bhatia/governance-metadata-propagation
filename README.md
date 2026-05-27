@@ -15,6 +15,7 @@ This project demonstrates an agentic data governance solution using Google Cloud
 *   **Unified UI & CLI**: Manage governance tasks via a Gradio-based web app or a headless CLI.
 *   **Policy Tag Propagation**: Recommends and applies BigQuery policy tags via lineage, with support for "straight pull" detection and an integrated **Access Summary** (Readers & Data Policies).
 *   **Data Trust Center (DQ)**: Derived trust scores for views and tables based on upstream Dataplex DQ/Profiling results and multi-hop lineage.
+*   **Unstructured Document Processing**: Leverage PDFs, TXT, and Markdown files to influence column descriptions and policy tags using Gemini and RAG.
 *   **Remediation Detection**: Automatically detects SQL transformations (e.g. `COALESCE`, `DISTINCT`) that improve data quality and applies "Trust Bonuses".
 *   **Trust History Persistence**: Tracks 0.0-1.0 trust scores over time in BigQuery for trend analysis.
 *   **CLL API Preview allowlisting required**: Please contact your Google Cloud account team to get access to CLL API
@@ -101,8 +102,11 @@ python3 steward_cli.py glossary-recommend --dataset retail_syn_data --table tran
 # Scan a dataset for existing policy tags
 python3 steward_cli.py policy-scan --dataset retail_syn_data
 
-# Preview and apply policy tag propagation to a table
+# Preview and apply policy tag propagation to a table (Lineage-based)
 python3 steward_cli.py policy-propagate --dataset retail_syn_data --table transactions --apply
+
+# Preview and apply policy tag propagation using Document context
+python3 steward_cli.py policy-propagate --dataset retail_syn_data --table transactions --document docs/large_doc.pdf --context-mode rag
 
 # Analyze and propagate trust/DQ scores for a view or table
 python3 steward_cli.py dq-propagate --dataset retail_syn_data --table customers
@@ -112,8 +116,15 @@ python3 steward_cli.py dq-propagate --dataset retail_syn_data --table customers
 python3 steward_cli.py dataplex-propagate --dataset retail_syn_data --table transactions --apply
 ```
 
+## 📄 Unstructured Document Processing
+The tool can leverage unstructured documents (PDFs, TXT, MD) to influence data governance metadata when lineage is missing or to supplement it.
+
+### Supported Components
+*   **Column Descriptions**: Extracts business meanings and definitions for columns. Enforces strict grounding to avoid hallucinations.
+*   **Policy Tags (PII)**: Extracts explicit sensitivity labels (like `PII: Y`) from documents and maps them to allowed policy tags in your project. No inference or guessing.
+
 ### Document Context Modes
-When using the `--document` flag with the `apply` command, you can specify a `--context-mode` to choose how the document is processed:
+When using the `--document` flag with the `apply` or `policy-propagate` commands, you can specify a `--context-mode` to choose how the document is processed:
 
 *   **`direct` (Context Injection)**: Reads the full text of the document(s) and appends it directly to the Gemini prompt for each column. Best for small documents.
     ```bash
