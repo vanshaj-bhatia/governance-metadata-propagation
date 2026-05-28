@@ -57,6 +57,9 @@ def main():
     glossary_parser = subparsers.add_parser("glossary-recommend", help="Recommend glossary terms for a table")
     glossary_parser.add_argument("--dataset", "--dataset_id", dest="dataset", required=True, help="BigQuery Dataset ID")
     glossary_parser.add_argument("--table", "--table_id", dest="table", required=True, help="BigQuery Table ID")
+    glossary_parser.add_argument("--document", nargs="+", help="Path to unstructured document(s) for context")
+    glossary_parser.add_argument("--context-mode", choices=["direct", "rag", "datastore"], default="rag", help="Mode for processing document context")
+    glossary_parser.add_argument("--datastore-id", help="Vertex AI Search DataStore ID (required for datastore mode)")
 
     # Policy Tag scan command
     policy_scan_parser = subparsers.add_parser("policy-scan", help="Scan dataset for existing policy tags")
@@ -179,7 +182,13 @@ def main():
             
     elif args.command == "glossary-recommend":
         print(f"Fetching glossary recommendations for '{args.dataset}.{args.table}'...")
-        df = glossary_plugin.recommend_terms_for_table(args.dataset, args.table)
+        df = glossary_plugin.recommend_terms_for_table(
+            args.dataset, 
+            args.table,
+            doc_path=args.document,
+            context_mode=args.context_mode,
+            datastore_id=args.datastore_id
+        )
         
         if df.empty:
             print("No recommendations found.")

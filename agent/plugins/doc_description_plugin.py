@@ -146,6 +146,46 @@ class DocDescriptionPlugin(BasePlugin):
             }
         return None
 
+    def recommend_glossary_terms_for_column(self, table_id: str, col_name: str, col_type: str, allowed_terms: List[str]) -> Optional[Dict[str, Any]]:
+        """Recommends a glossary term for a single column based on selected mode (Strict Grounding)."""
+        self._ensure_initialized()
+        
+        logger.info(f"Analyzing Glossary Term for column '{col_name}' in table '{table_id}' using mode '{self.mode}'...")
+        
+        query = f"Table: {table_id}, Column: {col_name} ({col_type})"
+        context = ""
+        top_score = 0.8 # Default fallback
+        
+        if self.mode == "rag":
+            chunks = self._rag_engine.retrieve(query, top_k=5)
+            if chunks:
+                context = "\n---\n".join([c['text'] for c in chunks])
+                top_score = chunks[0]['score']
+                
+        elif self.mode == "direct":
+            if hasattr(self, 'full_text') and self.full_text:
+                context = self.full_text
+                
+        elif self.mode == "datastore":
+            if self.datastore_id:
+                context = self._query_datastore(query)
+                
+        if not context:
+            return None
+            
+        # Generate Glossary Term recommendation via Gemini
+        term = self._generate_glossary_term_with_context(table_id, col_name, col_type, context, allowed_terms)
+        
+        if term and term != "NO_INFO":
+            return {
+                "Target Column": col_name,
+                "Proposed Term": term,
+                "Confidence": round(top_score, 2),
+                "Source": f"Document ({self.mode})",
+                "Rationale": f"Extracted explicit glossary term from {self.mode} document processing"
+            }
+        return None
+
     def _query_datastore(self, query: str) -> str:
         """Queries the Vertex AI Search DataStore using REST API."""
         import requests
@@ -347,4 +387,46 @@ Instructions:
             return text
         except Exception as e:
             logger.error(f"Failed to generate policy tag for {col_name}: {e}")
+            return ""
+
+    def _generate_glossary_term_with_context(self, table_id: str, col_name: str, col_type: str, context: str, allowed_terms: List[str]) -> str:
+        """Calls Gemini to extract glossary terms based on context with strict grounding."""
+        if not context:
+            logger.warning(f"No context found for column {col_name}")
+            return ""
+            
+        terms_str = ", ".join([f"'{t}'" for t in allowed_terms])
+            
+        prompt = f"""
+You are a Data Steward. Your task is to identify if a database column maps to a specific Business Glossary term based on the provided reference documentation.
+
+Table Name: {table_id}
+Column Name: {col_name}
+Column Type: {col_type}
+
+Reference Documentation:
+{context}
+
+Instructions:
+1. Look for explicit statements mapping this column to a business concept or term in the allowed list.
+2. The documentation might contain information about OTHER tables. You MUST ignore information that does not pertain to the table '{table_id}'.
+3. If the documentation does not explicitly map this column to a term in the list in the context of table '{table_id}', you MUST reply with "NO_INFO".
+4. Do NOT infer or guess that a column maps to a term based on its name or description unless the document EXPLICITLY states the mapping or definition that equates to the term.
+5. You MUST ONLY choose a term from this list of allowed terms: [{terms_str}].
+6. Reply with ONLY the exact term name from the list, or "NO_INFO".
+"""
+        logger.debug(f"Gemini Glossary Prompt:\n{prompt}")
+        try:
+            response = self._client.models.generate_content(
+                model="gemini-2.5-flash-lite",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.0
+                )
+            )
+            text = response.text.strip()
+            logger.debug(f"Gemini Glossary Response:\n{text}")
+            return text
+        except Exception as e:
+            logger.error(f"Failed to generate glossary term for {col_name}: {e}")
             return ""

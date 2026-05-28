@@ -9,7 +9,7 @@ This project demonstrates an agentic data governance solution using Google Cloud
 *   **Estate Dashboard**: Scan BigQuery datasets to identify metadata gaps (missing descriptions).
 *   **Recursive Description Propagation**: Automatically fetch descriptions from upstream sources, bridging multi-hop gaps.
 *   **SQL-Based Logic Enrichment**: Extracts BigQuery SQL transformations to generate human-readable descriptions for computed columns.
-*   **AI Business Glossary**: Maps technical columns to business terms using Vertex AI Semantic Similarity.
+*   **AI Business Glossary**: Maps technical columns to business terms using Vertex AI Semantic Similarity and **Unstructured Documents** (PDFs, TXT, MD).
 *   **Prioritized Glossary Propagation**: Automatically propagates glossary terms across tables based on lineage, with strict verification thresholds to ensure accuracy (especially for 1-1 mappings).
 *   **Native Dataplex Integration**: Persists glossary mappings as native `EntryLinks` visible in the Dataplex Schema tab.
 *   **Unified UI & CLI**: Manage governance tasks via a Gradio-based web app or a headless CLI.
@@ -99,6 +99,9 @@ python3 steward_cli.py apply --dataset retail_syn_data --table transactions --do
 # Recommend glossary terms using Vertex AI Semantic Similarity
 python3 steward_cli.py glossary-recommend --dataset retail_syn_data --table transactions
 
+# Recommend glossary terms using Document context
+python3 steward_cli.py glossary-recommend --dataset retail_syn_data --table transactions --document docs/glossary.pdf --context-mode rag
+
 # Scan a dataset for existing policy tags
 python3 steward_cli.py policy-scan --dataset retail_syn_data
 
@@ -122,9 +125,10 @@ The tool can leverage unstructured documents (PDFs, TXT, MD) to influence data g
 ### Supported Components
 *   **Column Descriptions**: Extracts business meanings and definitions for columns. Enforces strict grounding to avoid hallucinations.
 *   **Policy Tags (PII)**: Extracts explicit sensitivity labels (like `PII: Y`) from documents and maps them to allowed policy tags in your project. No inference or guessing.
+*   **Business Glossary Terms**: Maps columns to a controlled list of business terms based on explicit mentions in documents. Enforces strict grounding.
 
 ### Document Context Modes
-When using the `--document` flag with the `apply` or `policy-propagate` commands, you can specify a `--context-mode` to choose how the document is processed:
+When using the `--document` flag with the `apply`, `policy-propagate`, or `glossary-recommend` commands, you can specify a `--context-mode` to choose how the document is processed:
 
 *   **`direct` (Context Injection)**: Reads the full text of the document(s) and appends it directly to the Gemini prompt for each column. Best for small documents.
     ```bash
