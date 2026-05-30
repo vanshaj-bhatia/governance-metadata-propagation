@@ -322,7 +322,7 @@ class GlossaryPlugin(BasePlugin):
         return f"projects/{self.project_id}/locations/{self.location}/entryGroups/@bigquery/entries/{entry_id}"
 
     def _resolve_term_entry_name(self, term_resource_name: str) -> Optional[str]:
-        """Maps a Business Glossary term resource name to its Dataplex Catalog Entry name."""
+        """Maps a Business Glossary term resource name to its Knowledge Catalog Entry name."""
         client = dataplex_v1.CatalogServiceClient(credentials=get_credentials(self.project_id))
         
         # We try deterministic patterns FIRST as they are faster and don't rely on eventual consistency of Search

@@ -31,6 +31,58 @@ except ImportError as e:
     print(f"Error: Could not import Plugins. {e}")
     sys.exit(1)
 
+def print_beautiful_table(df: pd.DataFrame, col_widths: dict = None):
+    """Formats and prints a pandas DataFrame beautifully for the terminal."""
+    import textwrap
+    
+    if df.empty:
+        print("No data available.")
+        return
+        
+    if not col_widths:
+        col_widths = {}
+        for col in df.columns:
+            max_len = max(df[col].astype(str).map(len).max(), len(col))
+            col_widths[col] = min(max(max_len, 10), 40)
+
+    border = "+" + "+".join(["-" * (w + 2) for w in col_widths.values()]) + "+"
+    header_row = "|" + "|".join([f" \033[1m{col:<{col_widths[col]}}\033[0m " for col in col_widths.keys()]) + "|"
+    
+    print(border)
+    print(header_row)
+    print(border.replace("-", "="))
+    
+    for _, row in df.iterrows():
+        col_lines = {}
+        max_lines = 1
+        
+        for col in col_widths.keys():
+            val = str(row.get(col, ""))
+            val = val.replace("\n", " ").replace("\r", " ")
+            lines = textwrap.wrap(val, width=col_widths[col])
+            if not lines:
+                lines = [""]
+            col_lines[col] = lines
+            max_lines = max(max_lines, len(lines))
+            
+        for line_idx in range(max_lines):
+            row_parts = []
+            for col in col_widths.keys():
+                lines = col_lines[col]
+                text = lines[line_idx] if line_idx < len(lines) else ""
+                
+                if col in ["Confidence", "Trust"] or "Score" in col:
+                    try:
+                        num_val = float(text)
+                        text = f"{num_val:.2f}"
+                        row_parts.append(f" {text:>{col_widths[col]}} ")
+                    except ValueError:
+                        row_parts.append(f" {text:<{col_widths[col]}} ")
+                else:
+                    row_parts.append(f" {text:<{col_widths[col]}} ")
+            print("|" + "|".join(row_parts) + "|")
+        print(border)
+
 def main():
     parser = argparse.ArgumentParser(description="Agentic Data Steward CLI")
     parser.add_argument("--project", "--project_id", dest="project", default=os.environ.get("GOOGLE_CLOUD_PROJECT", "governance-agent"), help="GCP Project ID")
@@ -80,8 +132,8 @@ def main():
     dq_propagate_parser.add_argument("--dataset", "--dataset_id", dest="dataset", required=True, help="BigQuery Dataset ID")
     dq_propagate_parser.add_argument("--table", "--table_id", dest="table", required=True, help="BigQuery Table or View ID")
 
-    # Dataplex Propagate command (Unified)
-    dataplex_propagate_parser = subparsers.add_parser("dataplex-propagate", help="End-to-end Dataplex AI Insight propagation (Trigger -> Extract -> Apply)")
+    # Knowledge Catalog Propagate command (Unified)
+    dataplex_propagate_parser = subparsers.add_parser("knowledge-propagate", aliases=["dataplex-propagate"], help="End-to-end Knowledge Catalog AI Insight propagation (Trigger -> Extract -> Apply)")
     dataplex_propagate_parser.add_argument("--dataset", "--dataset_id", dest="dataset", required=True, help="BigQuery Dataset ID")
     dataplex_propagate_parser.add_argument("--table", "--table_id", dest="table", help="Specific BigQuery Table ID (optional)")
     dataplex_propagate_parser.add_argument("--apply", action="store_true", help="Apply updates to BigQuery")
@@ -158,7 +210,13 @@ def main():
         print("\nProposed Description Updates:")
         # Display relevant columns
         display_df = df[["Target Column", "Source", "Proposed Description", "Confidence"]]
-        print(display_df.to_string(index=False))
+        widths = {
+            "Target Column": 18,
+            "Source": 20,
+            "Proposed Description": 50,
+            "Confidence": 10
+        }
+        print_beautiful_table(display_df, widths)
         
         if args.yes:
             do_apply = True
@@ -194,7 +252,13 @@ def main():
             print("No recommendations found.")
         else:
             print("\nGlossary Term Recommendations:")
-            print(df[["Column", "Suggested Term", "Confidence", "Rationale"]].to_string(index=False))
+            widths = {
+                "Column": 18,
+                "Suggested Term": 22,
+                "Confidence": 10,
+                "Rationale": 45
+            }
+            print_beautiful_table(df[["Column", "Suggested Term", "Confidence", "Rationale"]], widths)
             print("\nNote: Use the UI or a separate apply command to persist these mappings.")
  
     elif args.command == "policy-scan":
@@ -221,7 +285,15 @@ def main():
         else:
             print("\nPolicy Tag Propagation Recommendations:")
             cols_to_show = ["Target Column", "Source Table", "Policy Tags", "Recommendation", "Logic", "Access Summary"]
-            print(df[cols_to_show].to_string(index=False))
+            widths = {
+                "Target Column": 16,
+                "Source Table": 15,
+                "Policy Tags": 20,
+                "Recommendation": 15,
+                "Logic": 25,
+                "Access Summary": 25
+            }
+            print_beautiful_table(df[cols_to_show], widths)
             
             if args.apply:
                 do_apply = True
@@ -320,25 +392,33 @@ def main():
             
         df = pd.DataFrame(results)
         print("\nColumn Trust Metrics (Calculated from Upstream Leaves):")
-        print(df.to_string(index=False))
+        widths = {
+            "Column": 18,
+            "Trust": 8,
+            "Badge": 10,
+            "Trend": 10,
+            "Source Path": 25,
+            "Bonus": 8
+        }
+        print_beautiful_table(df, widths)
         print("\nNote: Trust history for these columns has been updated and persisted to BigQuery.")
 
-    elif args.command == "dataplex-propagate":
+    elif args.command in ["knowledge-propagate", "dataplex-propagate"]:
         from insights_connector import DataInsightsClient as DescriptionPropagator
         from insights_connector import DataInsightsClient
         import propagate_metadata
         from lineage_propagation import LineageGraphTraverser
 
-        print(f"🚀 Starting Unified Dataplex Insights Workflow for {args.dataset}{'.' + args.table if args.table else ''}...")
+        print(f"🚀 Starting Unified Knowledge Catalog Insights Workflow for {args.dataset}{'.' + args.table if args.table else ''}...")
         
         client = DataInsightsClient(project_id=args.project, location=args.location)
         
         # 1. Trigger -> Wait -> Extract
-        print("--- Phase 1: Dataplex AI Scan & Extraction ---")
+        print("--- Phase 1: Knowledge Catalog AI Scan & Extraction ---")
         insights = client.run_full_sync(dataset_id=args.dataset, table_id=args.table)
         
         if not insights:
-            print("❌ Failed to retrieve insights from Dataplex.")
+            print("❌ Failed to retrieve insights from Knowledge Catalog.")
             return
 
         # 2. Apply (Pull Mode)
@@ -363,7 +443,7 @@ def main():
             propagate_metadata.propagate_table_level(args.project, args.dataset, table, description_propagator, mode)
             propagate_metadata.propagate_pull(args.project, args.dataset, table, lineage_traverser, description_propagator, mode)
 
-        print("\n✅ Dataplex Insights propagation complete.")
+        print("\n✅ Knowledge Catalog Insights propagation complete.")
 
     else:
 

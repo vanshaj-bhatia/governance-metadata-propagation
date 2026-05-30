@@ -20,7 +20,7 @@ def _get_permission_help():
     return f"""
 ---------------------------------------------------------
 💡 PERMISSION REQUIRED:
-Dataplex needs 'Fine-Grained Reader' access to the Data Catalog Taxonomy.
+Knowledge Catalog needs 'Fine-Grained Reader' access to the Data Catalog Taxonomy.
 Run this command in your terminal to grant access:
 
 gcloud data-catalog taxonomies add-iam-policy-binding [TAXONOMY_ID] \\
@@ -67,7 +67,7 @@ def create_dq_scan(table_name, credentials=None):
     data_scan.data.resource = f"//bigquery.googleapis.com/projects/{PROJECT_ID}/datasets/{DATASET_ID}/tables/{table_name}"
     data_scan.data_quality_spec = data_quality_spec
     
-    # Results are automatically published to Dataplex Catalog.
+    # Results are automatically published to Knowledge Catalog.
     
     try:
         operation = client.create_data_scan(
@@ -109,7 +109,7 @@ def create_profiling_scan(table_name, credentials=None):
     data_scan.data_profile_spec = data_profile_spec
     data_scan.type_ = "DATA_PROFILE"
     
-    # Results are automatically published to Dataplex Catalog.
+    # Results are automatically published to Knowledge Catalog.
     
     try:
         operation = client.create_data_scan(
