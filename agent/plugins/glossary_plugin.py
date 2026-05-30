@@ -13,6 +13,7 @@ from glossary_management import GlossaryClient
 from similarity_engine import SimilarityEngine
 from context import get_credentials, get_oauth_token
 from lineage_propagation import LineageGraphTraverser
+from doc_description_plugin import DocDescriptionPlugin
 
 logger = logging.getLogger(__name__)
 
@@ -119,9 +120,9 @@ class GlossaryPlugin(BasePlugin):
         except Exception:
             return False
 
-    def recommend_terms_for_table(self, dataset_id: str, table_id: str) -> pd.DataFrame:
+    def recommend_terms_for_table(self, dataset_id: str, table_id: str, doc_path: Optional[List[str]] = None, context_mode: str = "rag", datastore_id: Optional[str] = None) -> pd.DataFrame:
         """
-        Fetches recommendations for all columns in a table using Vertex AI Embeddings.
+        Fetches recommendations for all columns in a table using Vertex AI Embeddings and Documents.
         """
         self._ensure_initialized()
         table_ref = f"{self.project_id}.{dataset_id}.{table_id}"
@@ -131,6 +132,13 @@ class GlossaryPlugin(BasePlugin):
         if not all_terms:
             logger.warning("No glossary terms found to recommend.")
             return pd.DataFrame()
+
+        # Initialize DocDescriptionPlugin if documents are provided
+        doc_plugin = None
+        if doc_path:
+            logger.info(f"Initializing DocDescriptionPlugin for Glossary in mode: {context_mode}")
+            doc_plugin = DocDescriptionPlugin(self.project_id, self.location)
+            doc_plugin.load_document(doc_path, mode=context_mode, datastore_id=datastore_id)
 
         # 1. Warm up Term Cache
         self._cache_term_embeddings(all_terms)
@@ -250,7 +258,40 @@ class GlossaryPlugin(BasePlugin):
                 # For demo clarity, we prioritize lineage and skip similarity-based suggestions for this column.
                 continue
 
-            # B. Similarity-Based Recommendations
+            # B. Document Search
+            if doc_plugin:
+                allowed_terms = [t['display_name'] for t in all_terms]
+                doc_rec = doc_plugin.recommend_glossary_terms_for_column(table_id, col_name, col_meta['type'], allowed_terms)
+                if doc_rec:
+                    if context_mode == "datastore":
+                        logger.info(f"  [FOUND Datastore] Glossary recommendation found for '{col_name}'.")
+                    elif context_mode == "direct":
+                        logger.info(f"  [FOUND Direct] Glossary recommendation found for '{col_name}'.")
+                    else:
+                        logger.info(f"  [FOUND RAG] Glossary recommendation found for '{col_name}'.")
+                        
+                    term_display = doc_rec["Proposed Term"]
+                    matched_term = next((t for t in all_terms if t['display_name'] == term_display), None)
+                    term_id = matched_term['name'] if matched_term else term_display
+                    
+                    recommendations.append({
+                        "Column": col_name,
+                        "Suggested Term": term_display,
+                        "Confidence": doc_rec["Confidence"],
+                        "Rationale": doc_rec["Rationale"],
+                        "Term ID": term_id
+                    })
+                    # Prioritize Document hits over Similarity
+                    continue
+                else:
+                    if context_mode == "datastore":
+                        logger.info(f"  [NOT FOUND Datastore] No glossary recommendation found for '{col_name}' in Datastore.")
+                    elif context_mode == "direct":
+                        logger.info(f"  [NOT FOUND Direct] No glossary recommendation found for '{col_name}' in document.")
+                    else:
+                        logger.info(f"  [NOT FOUND RAG] No glossary recommendation found for '{col_name}' in document.")
+
+            # C. Similarity-Based Recommendations
             suggestions = self._similarity_engine.get_ranked_suggestions(col_meta, all_terms, col_embedding=col_emb)
             
             for sug in suggestions:
@@ -427,4 +468,6 @@ class GlossaryPlugin(BasePlugin):
                     })
         
         return pd.DataFrame(gaps)
+
+
 

@@ -9,12 +9,13 @@ This project demonstrates an agentic data governance solution using Google Cloud
 *   **Estate Dashboard**: Scan BigQuery datasets to identify metadata gaps (missing descriptions).
 *   **Recursive Description Propagation**: Automatically fetch descriptions from upstream sources, bridging multi-hop gaps.
 *   **SQL-Based Logic Enrichment**: Extracts BigQuery SQL transformations to generate human-readable descriptions for computed columns.
-*   **AI Business Glossary**: Maps technical columns to business terms using Vertex AI Semantic Similarity.
+*   **AI Business Glossary**: Maps technical columns to business terms using Vertex AI Semantic Similarity and **Unstructured Documents** (PDFs, TXT, MD).
 *   **Prioritized Glossary Propagation**: Automatically propagates glossary terms across tables based on lineage, with strict verification thresholds to ensure accuracy (especially for 1-1 mappings).
 *   **Native Dataplex Integration**: Persists glossary mappings as native `EntryLinks` visible in the Dataplex Schema tab.
 *   **Unified UI & CLI**: Manage governance tasks via a Gradio-based web app or a headless CLI.
 *   **Policy Tag Propagation**: Recommends and applies BigQuery policy tags via lineage, with support for "straight pull" detection and an integrated **Access Summary** (Readers & Data Policies).
 *   **Data Trust Center (DQ)**: Derived trust scores for views and tables based on upstream Dataplex DQ/Profiling results and multi-hop lineage.
+*   **Unstructured Document Processing**: Leverage PDFs, TXT, and Markdown files to influence column descriptions and policy tags using Gemini and RAG.
 *   **Remediation Detection**: Automatically detects SQL transformations (e.g. `COALESCE`, `DISTINCT`) that improve data quality and applies "Trust Bonuses".
 *   **Trust History Persistence**: Tracks 0.0-1.0 trust scores over time in BigQuery for trend analysis.
 *   **CLL API Preview allowlisting required**: Please contact your Google Cloud account team to get access to CLL API
@@ -92,14 +93,23 @@ python3 steward_cli.py scan --dataset retail_syn_data
 # Preview and apply description propagation to a table
 python3 steward_cli.py apply --dataset retail_syn_data --table transactions
 
+# Preview and apply description propagation using Document Context (RAG)
+python3 steward_cli.py apply --dataset retail_syn_data --table transactions --document docs/design.pdf --context-mode rag
+
 # Recommend glossary terms using Vertex AI Semantic Similarity
 python3 steward_cli.py glossary-recommend --dataset retail_syn_data --table transactions
+
+# Recommend glossary terms using Document context
+python3 steward_cli.py glossary-recommend --dataset retail_syn_data --table transactions --document docs/glossary.pdf --context-mode rag
 
 # Scan a dataset for existing policy tags
 python3 steward_cli.py policy-scan --dataset retail_syn_data
 
-# Preview and apply policy tag propagation to a table
+# Preview and apply policy tag propagation to a table (Lineage-based)
 python3 steward_cli.py policy-propagate --dataset retail_syn_data --table transactions --apply
+
+# Preview and apply policy tag propagation using Document context
+python3 steward_cli.py policy-propagate --dataset retail_syn_data --table transactions --document docs/large_doc.pdf --context-mode rag
 
 # Analyze and propagate trust/DQ scores for a view or table
 python3 steward_cli.py dq-propagate --dataset retail_syn_data --table customers
@@ -107,6 +117,32 @@ python3 steward_cli.py dq-propagate --dataset retail_syn_data --table customers
 # NEW: End-to-end Dataplex AI Insight propagation (Trigger -> Extract -> Apply)
 # This handles the full scan, wait, and metadata update in one go.
 python3 steward_cli.py dataplex-propagate --dataset retail_syn_data --table transactions --apply
+```
+
+## 📄 Unstructured Document Processing
+The tool can leverage unstructured documents (PDFs, TXT, MD) to influence data governance metadata when lineage is missing or to supplement it.
+
+### Supported Components
+*   **Column Descriptions**: Extracts business meanings and definitions for columns. Enforces strict grounding to avoid hallucinations.
+*   **Policy Tags (PII)**: Extracts explicit sensitivity labels (like `PII: Y`) from documents and maps them to allowed policy tags in your project. No inference or guessing.
+*   **Business Glossary Terms**: Maps columns to a controlled list of business terms based on explicit mentions in documents. Enforces strict grounding.
+
+### Document Context Modes
+When using the `--document` flag with the `apply`, `policy-propagate`, or `glossary-recommend` commands, you can specify a `--context-mode` to choose how the document is processed:
+
+*   **`direct` (Context Injection)**: Reads the full text of the document(s) and appends it directly to the Gemini prompt for each column. Best for small documents.
+    ```bash
+    python3 steward_cli.py apply --dataset retail_syn_data --table transactions --document docs/small_doc.txt --context-mode direct
+    ```
+*   **`rag` (In-Memory RAG)**: Chunks the document, generates embeddings, and retrieves the most relevant snippets for each column. Best for large documents to save tokens and improve focus.
+    ```bash
+    python3 steward_cli.py apply --dataset retail_syn_data --table transactions --document docs/large_doc.pdf --context-mode rag
+    ```
+    > 💡 *Note: Vector embeddings are generated remotely using Vertex AI's `text-embedding-004` model and stored locally in-memory for fast similarity search.*
+*   **`datastore` (Managed DataStore)**: Queries a pre-existing Vertex AI Search DataStore. Best for enterprise setups with large document repositories.
+    ```bash
+    python3 steward_cli.py apply --dataset retail_syn_data --table transactions --context-mode datastore --datastore-id my-datastore-id
+    ```
 ```
 
 ### 3. Data Integration Scripts

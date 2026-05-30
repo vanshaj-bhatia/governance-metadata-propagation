@@ -15,6 +15,7 @@ from google.cloud import bigquery
 from context import get_oauth_token, get_credentials
 from lineage_propagation import LineageGraphTraverser, TransformationEnricher, SQLFetcher
 from insights_connector import DataInsightsClient as DescriptionPropagator
+from doc_description_plugin import DocDescriptionPlugin
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +150,7 @@ class LineagePlugin(BasePlugin):
             
         return None
 
-    def preview_propagation(self, dataset_id: str, target_table: str) -> pd.DataFrame:
+    def preview_propagation(self, dataset_id: str, target_table: str, document_path: Optional[List[str]] = None, context_mode: str = "rag", datastore_id: Optional[str] = None) -> pd.DataFrame:
         """
         Simulates description propagation for a specific table with multi-hop support and SQL parsing.
         """
@@ -160,19 +161,26 @@ class LineagePlugin(BasePlugin):
         table = client.get_table(table_ref)
         
         candidates = []
+        
+        # 1. Load document or datastore if provided (One-time setup)
+        doc_plugin = None
+        if document_path or datastore_id:
+            logger.info(f"Initializing DocDescriptionPlugin in mode: {context_mode}")
+            doc_plugin = DocDescriptionPlugin(self.project_id, self.location)
+            doc_plugin.load_document(document_path, mode=context_mode, datastore_id=datastore_id)
+            
         logger.info(f"--- Propagation Preview for {target_table} ---")
         for field in table.schema:
             if field.description:
                 logger.debug(f"Skipping column '{field.name}' - already has description.")
                 continue
                 
-            # Recursive search for this column
-            logger.info(f"Searching source for column '{field.name}'...")
+            # A. Lineage Search
+            logger.info(f"Searching source for column '{field.name}' via lineage...")
             match = self._find_description_recursive(target_fqn, field.name)
             
             if match:
-                logger.info(f"  [FOUND] Source: {match['source_entity']}.{match['source_column']} -> {match['description'][:40]}...")
-                # Enrich the found description using accumulated logic
+                logger.info(f"  [FOUND Lineage] Source: {match['source_entity']}.{match['source_column']}")
                 enriched_desc = TransformationEnricher.enrich_description(
                     field.name, 
                     match['source_column'], 
@@ -189,10 +197,31 @@ class LineagePlugin(BasePlugin):
                     "Type": f"Lineage (Hop {match['hop_depth']})" if match['hop_depth'] > 0 else "Lineage"
                 })
             else:
-                logger.info(f"  [NOT FOUND] No source description found for '{field.name}'.")
+                logger.info(f"  [NOT FOUND Lineage] No source description found for '{field.name}'.")
+                
+            # B. Document RAG Search
+            if doc_plugin:
+                doc_rec = doc_plugin.recommend_description_for_column(target_table, field.name, field.field_type)
+                if doc_rec:
+                    if context_mode == "datastore":
+                        logger.info(f"  [FOUND Datastore] Recommendations found for '{field.name}'.")
+                    elif context_mode == "direct":
+                        logger.info(f"  [FOUND Direct] Recommendations found for '{field.name}'.")
+                    else:
+                        logger.info(f"  [FOUND RAG] Recommendations found for '{field.name}'.")
+                    candidates.append(doc_rec)
+                else:
+                    # Log based on context mode to provide clear context
+                    if context_mode == "datastore":
+                        logger.info(f"  [NOT FOUND Datastore] No recommendation found for '{field.name}' in Datastore.")
+                    elif context_mode == "direct":
+                        logger.info(f"  [NOT FOUND Direct] No recommendation found for '{field.name}' in document.")
+                    else:
+                        logger.info(f"  [NOT FOUND RAG] No recommendation found for '{field.name}' in document.")
 
         if not candidates:
-            logger.warning(f"No propagation candidates found for {target_table}. (Missing desc count: {len([f for f in table.schema if not f.description])})")
+            logger.warning(f"No propagation candidates found for {target_table}.")
+            
         return pd.DataFrame(candidates)
 
     def get_lineage_summary(self, dataset_id: str, table_id: str) -> str:

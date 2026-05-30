@@ -14,6 +14,7 @@ from google.cloud import bigquery, datacatalog_v1, bigquery_datapolicies_v1
 from google.iam.v1 import policy_pb2, iam_policy_pb2
 from context import get_credentials, get_oauth_token
 from lineage_propagation import LineageGraphTraverser, TransformationEnricher, SQLFetcher
+from doc_description_plugin import DocDescriptionPlugin
 
 logger = logging.getLogger(__name__)
 
@@ -85,9 +86,32 @@ class PolicyTagPlugin(BasePlugin):
 
         return pd.DataFrame(policy_tags_data)
 
-    def preview_policy_tag_propagation(self, dataset_id: str, target_table: str) -> pd.DataFrame:
+    def get_all_policy_tags(self, location: str) -> Dict[str, str]:
         """
-        Recommends policy tag propagation based on lineage.
+        Fetches all policy tags in the project's taxonomies for a specific location.
+        Returns a dict mapping display_name -> resource_name (full path).
+        """
+        self._ensure_initialized()
+        creds = self._get_credentials()
+        client = datacatalog_v1.PolicyTagManagerClient(credentials=creds)
+        
+        parent = f"projects/{self.project_id}/locations/{location}"
+        tag_map = {}
+        
+        try:
+            taxonomies = list(client.list_taxonomies(parent=parent))
+            for taxonomy in taxonomies:
+                tags = list(client.list_policy_tags(parent=taxonomy.name))
+                for tag in tags:
+                    tag_map[tag.display_name] = tag.name
+        except Exception as e:
+            logger.error(f"Failed to list policy tags: {e}")
+            
+        return tag_map
+
+    def preview_policy_tag_propagation(self, dataset_id: str, target_table: str, doc_path: Optional[List[str]] = None, context_mode: str = "rag", datastore_id: Optional[str] = None) -> pd.DataFrame:
+        """
+        Recommends policy tag propagation based on lineage and documents.
         """
         self._ensure_initialized()
         target_fqn = f"bigquery:{self.project_id}.{dataset_id}.{target_table}"
@@ -95,6 +119,19 @@ class PolicyTagPlugin(BasePlugin):
         table_ref = f"{self.project_id}.{dataset_id}.{target_table}"
         table = client.get_table(table_ref)
         
+        doc_plugin = None
+        if doc_path:
+            logger.info(f"Initializing DocDescriptionPlugin for Policy Tags in mode: {context_mode}")
+            doc_plugin = DocDescriptionPlugin(self.project_id, self.location)
+            doc_plugin.load_document(doc_path, mode=context_mode, datastore_id=datastore_id)
+            
+        allowed_tags_map = {}
+        if doc_path:
+            # Get dataset location to match region
+            dataset = client.get_dataset(f"{self.project_id}.{dataset_id}")
+            allowed_tags_map = self.get_all_policy_tags(dataset.location)
+            logger.info(f"Found {len(allowed_tags_map)} available policy tags in region {dataset.location}.")
+            
         recommendations = []
         
         for field in table.schema:
@@ -106,8 +143,7 @@ class PolicyTagPlugin(BasePlugin):
             lineage = self._lineage_traverser.get_column_lineage(target_fqn, [field.name], depth=0)
             sources = lineage.get(field.name, [])
             
-            if not sources:
-                continue
+            found_lineage = False
                 
             for source in sources:
                 src_entity = source['source_entity']
@@ -118,6 +154,7 @@ class PolicyTagPlugin(BasePlugin):
                     for src_field in src_table.schema:
                         if src_field.name == src_col and src_field.policy_tags:
                             # Found a source with policy tags
+                            found_lineage = True
                             
                             # Check for transformation
                             is_straight_pull = (src_col == field.name)
@@ -154,6 +191,38 @@ class PolicyTagPlugin(BasePlugin):
                             })
                 except Exception as e:
                     logger.warning(f"Failed to check source {src_entity}: {e}")
+                    
+            if not found_lineage:
+                logger.info(f"  [NOT FOUND Lineage] No source policy tags found for '{field.name}'.")
+                    
+            # B. Document Search
+            if doc_plugin and allowed_tags_map:
+                doc_rec = doc_plugin.recommend_policy_tag_for_column(target_table, field.name, field.field_type, list(allowed_tags_map.keys()))
+                if doc_rec:
+                    if context_mode == "datastore":
+                        logger.info(f"  [FOUND Datastore] Policy Tag recommendation found for '{field.name}'.")
+                    elif context_mode == "direct":
+                        logger.info(f"  [FOUND Direct] Policy Tag recommendation found for '{field.name}'.")
+                    else:
+                        logger.info(f"  [FOUND RAG] Policy Tag recommendation found for '{field.name}'.")
+                    # Map display name back to resource path
+                    resolved_tag = allowed_tags_map.get(doc_rec["Proposed Tag"], doc_rec["Proposed Tag"])
+                    recommendations.append({
+                        "Target Column": field.name,
+                        "Source Table": "Document",
+                        "Source Column": "N/A",
+                        "Policy Tags": resolved_tag,
+                        "Recommendation": "Apply (Found in Doc)",
+                        "Logic": "Explicitly labeled in document",
+                        "Access Summary": "N/A"
+                    })
+                else:
+                    if context_mode == "datastore":
+                        logger.info(f"  [NOT FOUND Datastore] No policy tag found for '{field.name}' in Datastore.")
+                    elif context_mode == "direct":
+                        logger.info(f"  [NOT FOUND Direct] No policy tag found for '{field.name}' in document.")
+                    else:
+                        logger.info(f"  [NOT FOUND RAG] No policy tag found for '{field.name}' in document.")
 
         return pd.DataFrame(recommendations)
 

@@ -6,3 +6,4 @@ credentials.json
 dq_history.json
 scratch/
 .agents/
+.rag_cache/
