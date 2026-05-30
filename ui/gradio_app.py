@@ -364,7 +364,7 @@ def apply_glossary_selections(project_id, location, dataset_id, table_id, reco_d
                 "term_display": row['Suggested Term']
             })
         plugin.apply_terms(dataset_id, table_id, updates)
-        return f"Successfully applied {len(updates)} glossary terms to {table_id} in Dataplex!"
+        return f"Successfully applied {len(updates)} glossary terms to {table_id} in Knowledge Catalog!"
     except Exception as e:
         logger.error(f"Glossary apply failed: {e}")
         raise gr.Error(f"Apply failed: {str(e)}")
@@ -500,12 +500,12 @@ def get_dq_propagation(project_id, location, dataset_id, table_id, request: gr.R
         logger.error(f"DQ propagation failed: {e}")
         raise gr.Error(f"Operation failed: {str(e)}")
 
-with gr.Blocks(title="Dataplex Data Steward") as demo:
+with gr.Blocks(title="Governance on Auto-pilot") as demo:
     gr.HTML(GCP_CSS)
     
     with gr.Column(visible=True) as login_view:
         with gr.Column(elem_classes=["gcp-card"]):
-            gr.Markdown("# Welcome to Dataplex Data Steward")
+            gr.Markdown("# Welcome to Governance on Auto-pilot")
             gr.Markdown("Proactively manage your metadata and governance at scale.")
             login_btn = gr.Button("Login with Google", variant="primary", elem_classes=["gr-button-primary"])
             login_btn.click(lambda: gr.Info("Redirecting to Google Login..."), None, None).then(
@@ -515,7 +515,7 @@ with gr.Blocks(title="Dataplex Data Steward") as demo:
     with gr.Column(visible=False) as app_view:
         with gr.Row():
             with gr.Column(scale=8):
-                gr.Markdown("# 🛡️ Agentic Data Steward")
+                gr.Markdown("# 🛡️ Governance on Auto-pilot")
             with gr.Column(scale=2):
                 logout_html = '<a href="/logout" style="color: #666; text-decoration: underline;">Logout</a>'
                 gr.HTML(logout_html)
@@ -655,7 +655,7 @@ with gr.Blocks(title="Dataplex Data Steward") as demo:
                         deselect_all_glossary_btn = gr.Button("Deselect All", size="sm", elem_classes=["gr-button-secondary"])
                     
                     with gr.Row():
-                        apply_glossary_btn = gr.Button("Apply Selected Terms to Dataplex", variant="primary", elem_classes=["gr-button-primary"])
+                        apply_glossary_btn = gr.Button("Apply Selected Terms to Knowledge Catalog", variant="primary", elem_classes=["gr-button-primary"])
                     
                     glossary_apply_result = gr.Textbox(label="Apply Status", interactive=False)
 
@@ -751,6 +751,14 @@ with gr.Blocks(title="Dataplex Data Steward") as demo:
 
     # Helper to check auth status
     def check_auth_status(request: gr.Request):
+        client_id = os.environ.get("GOOGLE_CLIENT_ID", "")
+        client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+        
+        # Bypass OAuth if client ID or secret are missing, placeholders, or if requested via env var
+        if not client_id or not client_secret or "YOUR_CLIENT_ID" in client_id or os.environ.get("BYPASS_OAUTH") == "true":
+            logger.info("Bypassing Google OAuth login screen (running in local ADC mode).")
+            return gr.update(visible=False), gr.update(visible=True)
+            
         if request and "google_token" in request.session:
             return gr.update(visible=False), gr.update(visible=True)
         return gr.update(visible=True), gr.update(visible=False)
