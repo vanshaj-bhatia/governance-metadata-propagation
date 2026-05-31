@@ -1,6 +1,10 @@
+import os
+# Force gRPC to use native IPv4 resolver to bypass macOS IPv6 lookup hangs/timeouts
+os.environ["GRPC_DNS_RESOLVER"] = "native"
+os.environ["GRPC_IPv6"] = "off"
+
 import argparse
 import sys
-import os
 import pandas as pd
 from typing import List, Dict, Any
 
@@ -89,6 +93,8 @@ def main():
     parser.add_argument("--location", default="europe-west1", help="GCP Location")
     parser.add_argument("--yes", "-y", action="store_true", help="Automatically approve all prompts")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging to file")
+    parser.add_argument("--cache-dataset", dest="cache_dataset", default=os.environ.get("GLOSSARY_CACHE_DATASET_ID"), help="GCP BigQuery dataset for glossary embeddings cache")
+    parser.add_argument("--cache-table", dest="cache_table", default=os.environ.get("GLOSSARY_CACHE_TABLE_ID"), help="GCP BigQuery table name for glossary embeddings cache")
     
     subparsers = parser.add_subparsers(dest="command", help="Commands")
     
@@ -104,6 +110,7 @@ def main():
     apply_parser.add_argument("--document", nargs="+", help="Path to unstructured document(s) to influence descriptions")
     apply_parser.add_argument("--context-mode", choices=["direct", "rag", "datastore"], default="rag", help="Mode to process document context")
     apply_parser.add_argument("--datastore-id", help="Vertex AI Search DataStore ID (required for datastore mode)")
+    apply_parser.add_argument("--force", action="store_true", help="Force propagation analysis even for columns that already have descriptions")
     
     # Glossary recommend command
     glossary_parser = subparsers.add_parser("glossary-recommend", help="Recommend glossary terms for a table")
@@ -168,7 +175,12 @@ def main():
     root_logger.addHandler(ch)
     
     plugin = LineagePlugin(args.project, args.location)
-    glossary_plugin = GlossaryPlugin(args.project, args.location)
+    glossary_plugin = GlossaryPlugin(
+        args.project, 
+        args.location, 
+        cache_dataset_id=args.cache_dataset, 
+        cache_table_id=args.cache_table
+    )
     policy_plugin = PolicyTagPlugin(args.project, args.location)
     doc_plugin = DocDescriptionPlugin(args.project, args.location)
     
@@ -200,7 +212,8 @@ def main():
             args.table, 
             document_path=args.document, 
             context_mode=args.context_mode, 
-            datastore_id=args.datastore_id
+            datastore_id=args.datastore_id,
+            force=args.force
         )
         
         if df.empty:

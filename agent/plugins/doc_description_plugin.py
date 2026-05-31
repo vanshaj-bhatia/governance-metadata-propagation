@@ -2,6 +2,7 @@ import sys
 import os
 import logging
 import pandas as pd
+import threading
 from typing import List, Dict, Any, Optional
 
 from google.adk.plugins.base_plugin import BasePlugin
@@ -21,20 +22,23 @@ class DocDescriptionPlugin(BasePlugin):
         self._bq_client = None
         self._rag_engine = None
         self._client = None
+        self._lock = threading.Lock()
 
     def _ensure_initialized(self):
-        creds = get_credentials(self.project_id)
-        if not self._bq_client:
-            self._bq_client = bigquery.Client(project=self.project_id, credentials=creds)
-        if not self._rag_engine:
-            self._rag_engine = DocumentRAGEngine(self.project_id, location=self.location, credentials=creds)
-        if not self._client:
-             self._client = genai.Client(
-                    project=self.project_id,
-                    location=self.location,
-                    credentials=creds,
-                    vertexai=True
-                )
+        if not self._bq_client or not self._rag_engine or not self._client:
+            with self._lock:
+                creds = get_credentials(self.project_id)
+                if not self._bq_client:
+                    self._bq_client = bigquery.Client(project=self.project_id, credentials=creds)
+                if not self._rag_engine:
+                    self._rag_engine = DocumentRAGEngine(self.project_id, location=self.location, credentials=creds)
+                if not self._client:
+                     self._client = genai.Client(
+                            project=self.project_id,
+                            location=self.location,
+                            credentials=creds,
+                            vertexai=True
+                        )
 
     def load_document(self, doc_path: Optional[List[str]], mode: str = "rag", datastore_id: Optional[str] = None):
         """Loads the document(s) or sets up the DataStore."""
@@ -331,13 +335,14 @@ Instructions:
 """
         logger.debug(f"Gemini Description Prompt:\n{prompt}")
         try:
-            response = self._client.models.generate_content(
-                model="gemini-2.5-flash-lite",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.0
+            with self._lock:
+                response = self._client.models.generate_content(
+                    model="gemini-2.5-flash-lite",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.0
+                    )
                 )
-            )
             text = response.text.strip()
             logger.debug(f"Gemini Description Response:\n{text}")
             if text == "NO_INFO":
@@ -375,13 +380,14 @@ Instructions:
 """
         logger.debug(f"Gemini Policy Tag Prompt:\n{prompt}")
         try:
-            response = self._client.models.generate_content(
-                model="gemini-2.5-flash-lite",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.0
+            with self._lock:
+                response = self._client.models.generate_content(
+                    model="gemini-2.5-flash-lite",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.0
+                    )
                 )
-            )
             text = response.text.strip()
             logger.debug(f"Gemini Policy Tag Response:\n{text}")
             return text
@@ -417,13 +423,14 @@ Instructions:
 """
         logger.debug(f"Gemini Glossary Prompt:\n{prompt}")
         try:
-            response = self._client.models.generate_content(
-                model="gemini-2.5-flash-lite",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.0
+            with self._lock:
+                response = self._client.models.generate_content(
+                    model="gemini-2.5-flash-lite",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.0
+                    )
                 )
-            )
             text = response.text.strip()
             logger.debug(f"Gemini Glossary Response:\n{text}")
             return text

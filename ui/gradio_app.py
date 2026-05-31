@@ -1,8 +1,12 @@
+import os
+# Force gRPC to use native IPv4 resolver to bypass macOS IPv6 lookup hangs/timeouts
+os.environ["GRPC_DNS_RESOLVER"] = "native"
+os.environ["GRPC_IPv6"] = "off"
+
 import gradio as gr
 import fastapi
 from fastapi.responses import RedirectResponse
 import sys
-import os
 import pandas as pd
 import logging
 from authlib.integrations.starlette_client import OAuth
@@ -44,9 +48,15 @@ logger = logging.getLogger(__name__)
 # Fetch Project ID from environment or default
 DEFAULT_PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT", "governance-agent")
 DEFAULT_LOCATION = "europe-west1"
-DEFAULT_DATASET_ID = os.environ.get("BIGQUERY_DATASET_ID", "retail_syn_data")
+DEFAULT_DATASET_ID = os.environ.get("BIGQUERY_DATASET_ID", "retail_synthetic_data")
 
 KNOWLEDGE_JSON_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "../knowledge_insights.json"))
+
+def handle_refresh_lineage_cache():
+    from lineage_propagation import LineageGraphTraverser
+    LineageGraphTraverser.clear_global_cache()
+    gr.Info("Unified Lineage Cache cleared successfully!")
+    return "Unified Lineage Cache cleared."
 
 def get_plugin(project_id, location):
     return LineagePlugin(project_id, location, knowledge_json_path=KNOWLEDGE_JSON_PATH)
@@ -56,12 +66,12 @@ def get_token_from_session(request: gr.Request):
         return request.session.get("google_token", {}).get("access_token")
     return None
 
-def scan_dataset(project_id, location, dataset_id, request: gr.Request = None):
+def scan_dataset(project_id, location, dataset_id, cache_dataset_id=None, cache_table_id=None, request: gr.Request = None):
     token = get_token_from_session(request)
     set_oauth_token(token)
     try:
         lineage_plugin = get_plugin(project_id, location)
-        glossary_plugin = GlossaryPlugin(project_id, location)
+        glossary_plugin = GlossaryPlugin(project_id, location, cache_dataset_id=cache_dataset_id, cache_table_id=cache_table_id)
         
         # 1. Scan for missing technical descriptions
         desc_df = lineage_plugin.scan_for_missing_descriptions(dataset_id)
@@ -329,14 +339,15 @@ def deselect_all_lineage(df):
         df["Select"] = [False] * len(df)
     return df
 
-def get_glossary_recommendations(project_id, location, dataset_id, table_id, request: gr.Request = None):
+def get_glossary_recommendations(project_id, location, dataset_id, table_id, min_confidence=0.5, cache_dataset_id=None, cache_table_id=None, request: gr.Request = None):
+    logger.info(f"get_glossary_recommendations called with project_id={project_id}, location={location}, dataset_id={dataset_id}, table_id={table_id}, min_confidence={min_confidence} (type: {type(min_confidence)})")
     token = get_token_from_session(request)
     set_oauth_token(token)
     try:
-        plugin = GlossaryPlugin(project_id, location)
-        df = plugin.recommend_terms_for_table(dataset_id, table_id)
+        plugin = GlossaryPlugin(project_id, location, cache_dataset_id=cache_dataset_id, cache_table_id=cache_table_id)
+        df = plugin.recommend_terms_for_table(dataset_id, table_id, min_confidence=float(min_confidence))
         if df.empty:
-            gr.Info(f"No glossary recommendations found for {table_id}.")
+            gr.Info(f"No glossary recommendations found for {table_id} with confidence >= {min_confidence}.")
             return pd.DataFrame(columns=["Select", "Column", "Suggested Term", "Confidence", "Rationale", "Term ID"])
         df.insert(0, "Select", [True] * len(df))
         return df
@@ -344,7 +355,7 @@ def get_glossary_recommendations(project_id, location, dataset_id, table_id, req
         logger.error(f"Glossary recommendations failed: {e}")
         raise gr.Error(f"Operation failed: {str(e)}")
 
-def apply_glossary_selections(project_id, location, dataset_id, table_id, reco_df, request: gr.Request = None):
+def apply_glossary_selections(project_id, location, dataset_id, table_id, reco_df, cache_dataset_id=None, cache_table_id=None, request: gr.Request = None):
     token = get_token_from_session(request)
     set_oauth_token(token)
     try:
@@ -355,7 +366,7 @@ def apply_glossary_selections(project_id, location, dataset_id, table_id, reco_d
         if selected.empty:
             gr.Warning("No terms selected for application.")
             return "No terms selected."
-        plugin = GlossaryPlugin(project_id, location)
+        plugin = GlossaryPlugin(project_id, location, cache_dataset_id=cache_dataset_id, cache_table_id=cache_table_id)
         updates = []
         for _, row in selected.iterrows():
             updates.append({
@@ -524,6 +535,12 @@ with gr.Blocks(title="Governance on Auto-pilot") as demo:
             with gr.Row():
                 config_project = gr.Textbox(label="Project ID", value=DEFAULT_PROJECT_ID)
                 config_location = gr.Textbox(label="Location", value=DEFAULT_LOCATION)
+            with gr.Row():
+                config_cache_dataset = gr.Textbox(label="Glossary Cache Dataset ID", value="", placeholder="Default: Active Scanned Dataset ID", info="Optional: Redirect embeddings cache storage to a separate writable dataset")
+                config_cache_table = gr.Textbox(label="Glossary Cache Table ID", value="glossary_embeddings_cache", info="Configure custom BigQuery table name for glossary embeddings cache")
+                refresh_lineage_btn = gr.Button("🔄 Refresh Lineage Cache", variant="secondary", size="sm", elem_classes=["gr-button-secondary"])
+            
+            refresh_lineage_btn.click(handle_refresh_lineage_cache, inputs=None, outputs=None)
     
         with gr.Tabs():
             with gr.TabItem("Dashboard"):
@@ -575,8 +592,8 @@ with gr.Blocks(title="Governance on Auto-pilot") as demo:
                             wrap=True
                         )
                 
-                def dashboard_scan_wrapper(project, loc, ds, request: gr.Request):
-                    summary, d_agg, g_agg, o_agg, d_cnt, g_cnt, o_cnt = scan_dataset(project, loc, ds, request)
+                def dashboard_scan_wrapper(project, loc, ds, cache_ds, cache_tbl, request: gr.Request):
+                    summary, d_agg, g_agg, o_agg, d_cnt, g_cnt, o_cnt = scan_dataset(project, loc, ds, cache_ds, cache_tbl, request)
                     
                     d_html = f"<div class='gcp-metric-value'>{d_cnt}</div><div class='gcp-metric-label'>Description Gaps</div>"
                     g_html = f"<div class='gcp-metric-value'>{g_cnt}</div><div class='gcp-metric-label'>Glossary Gaps</div>"
@@ -586,7 +603,7 @@ with gr.Blocks(title="Governance on Auto-pilot") as demo:
 
                 scan_btn.click(
                     dashboard_scan_wrapper, 
-                    inputs=[config_project, config_location, global_dataset], 
+                    inputs=[config_project, config_location, global_dataset, config_cache_dataset, config_cache_table], 
                     outputs=[dash_summary, desc_output, glossary_gap_output, orphan_output, desc_metric, gloss_metric, orphan_metric]
                 )
 
@@ -639,6 +656,7 @@ with gr.Blocks(title="Governance on Auto-pilot") as demo:
                     
                     with gr.Row():
                         glossary_table = gr.Textbox(label="Target Table", value="customers")
+                        confidence_slider = gr.Slider(minimum=0.0, maximum=1.0, value=0.5, step=0.05, label="Minimum Confidence Threshold", info="Filter out weak recommendations")
                     
                     recommend_btn = gr.Button("Get Glossary Recommendations", variant="primary", elem_classes=["gr-button-primary"])
                 
@@ -666,13 +684,13 @@ with gr.Blocks(title="Governance on Auto-pilot") as demo:
                     lambda: "", outputs=[glossary_apply_result]
                 ).then(
                     get_glossary_recommendations,
-                    inputs=[config_project, config_location, global_dataset, glossary_table],
+                    inputs=[config_project, config_location, global_dataset, glossary_table, confidence_slider, config_cache_dataset, config_cache_table],
                     outputs=recommendations_view
                 )
                 
                 apply_glossary_btn.click(
                     apply_glossary_selections,
-                    inputs=[config_project, config_location, global_dataset, glossary_table, recommendations_view],
+                    inputs=[config_project, config_location, global_dataset, glossary_table, recommendations_view, config_cache_dataset, config_cache_table],
                     outputs=glossary_apply_result
                 )
 
@@ -795,6 +813,8 @@ if __name__ == "__main__":
         return RedirectResponse(url="/")
 
     app = gr.mount_gradio_app(main_app, demo, path="/")
+
+
 
     import uvicorn
     host = os.environ.get("HOST", "0.0.0.0")

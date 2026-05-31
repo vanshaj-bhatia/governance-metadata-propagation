@@ -3,128 +3,375 @@ import os
 import logging
 import pandas as pd
 from typing import List, Dict, Any, Optional
+import threading
+import json
+import hashlib
 
 # Add paths
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../dataplex_integration')))
 
 from google.adk.plugins.base_plugin import BasePlugin
 from google.cloud import bigquery, dataplex_v1
+from google.auth.transport.requests import AuthorizedSession
 from glossary_management import GlossaryClient
 from similarity_engine import SimilarityEngine
-from context import get_credentials, get_oauth_token
+from context import get_credentials, get_oauth_token, set_oauth_token
 from lineage_propagation import LineageGraphTraverser
 from doc_description_plugin import DocDescriptionPlugin
 
 logger = logging.getLogger(__name__)
 
 class GlossaryPlugin(BasePlugin):
-    def __init__(self, project_id: str, location: str = "europe-west1"):
+    def __init__(self, project_id: str, location: str = "europe-west1", cache_dataset_id: Optional[str] = None, cache_table_id: Optional[str] = None):
         super().__init__(name="glossary_plugin")
         self.project_id = project_id
         self.location = location
+        self.dataset_id = os.environ.get("BIGQUERY_DATASET_ID", "retail_synthetic_data")
+        self.cache_dataset_id = cache_dataset_id or os.environ.get("GLOSSARY_CACHE_DATASET_ID", self.dataset_id)
+        self.cache_table_id = cache_table_id or os.environ.get("GLOSSARY_CACHE_TABLE_ID", "glossary_embeddings_cache")
         self._glossary_client = None
         self._similarity_engine = None
         self._bq_client = None
+        self._catalog_client = None
         self._lineage_traverser = None
         self._link_check_cache = {} # Cache for _check_link_exists: (dataset, table, col, term) -> bool
+        self._lock = threading.Lock()
+
+    def _get_bq_client(self):
+        creds = get_credentials(self.project_id)
+        return bigquery.Client(project=self.project_id, credentials=creds)
 
     def _ensure_initialized(self):
         creds = get_credentials(self.project_id)
+        token = get_oauth_token()
         if not self._glossary_client:
             self._glossary_client = GlossaryClient(self.project_id, self.location, credentials=creds)
         if not self._similarity_engine:
             # Vertex AI models are best supported in us-central1 for now
             self._similarity_engine = SimilarityEngine(self.project_id, location="us-central1", credentials=creds)
         if not self._bq_client:
-            self._bq_client = bigquery.Client(project=self.project_id, credentials=creds)
+            self._bq_client = self._get_bq_client()
+        if not self._catalog_client:
+            try:
+                self._catalog_client = dataplex_v1.CatalogServiceClient(credentials=creds)
+            except Exception as e:
+                logger.warning(f"Failed to initialize CatalogServiceClient (Dataplex Catalog): {e}")
+                self._catalog_client = None
         if not self._lineage_traverser:
-            token = get_oauth_token()
             self._lineage_traverser = LineageGraphTraverser(self.project_id, self.location, token=token)
 
+        # Spawn background cache warming thread at the very end when all clients are fully initialized
+        if hasattr(self, '_similarity_engine') and self._similarity_engine:
+            # Check if cache has not been warmed in this session yet
+            if not hasattr(self, '_cache_warming_started'):
+                self._cache_warming_started = True
+                def warm_cache_thread():
+                    set_oauth_token(token)
+                    try:
+                        terms = self._glossary_client.get_all_terms()
+                        if terms:
+                            self._cache_term_embeddings(terms)
+                    except Exception as e:
+                        logger.warning(f"Background embedding cache warming failed: {e}")
+
+                threading.Thread(target=warm_cache_thread, daemon=True).start()
+
+    def _get_local_cache_path(self) -> str:
+        # Make cache path portable by using a directory relative to the plugin file inside the workspace
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../scratch"))
+        os.makedirs(base_dir, exist_ok=True)
+        return os.path.join(base_dir, "glossary_embeddings_cache.json")
+
+    def _init_bq_cache_table_if_not_exists(self):
+        """Creates the glossary_embeddings_cache table in BigQuery if missing."""
+        client = self._bq_client
+        table_ref = f"{self.project_id}.{self.cache_dataset_id}.{self.cache_table_id}"
+        try:
+            client.get_table(table_ref)
+        except Exception:
+            # Table doesn't exist, create it
+            logger.info(f"Creating BigQuery glossary embeddings cache table: {table_ref}")
+            schema = [
+                bigquery.SchemaField("term_id", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("hash_val", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("embedding_json", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("update_time", "TIMESTAMP", default_value="CURRENT_TIMESTAMP()"),
+            ]
+            table = bigquery.Table(table_ref, schema=schema)
+            client.create_table(table)
+
+    def _load_hybrid_cache(self) -> Dict[str, Dict[str, Any]]:
+        """Loads the glossary embeddings cache from local file or BigQuery fallback."""
+        local_path = self._get_local_cache_path()
+        
+        # 1. Try local JSON cache
+        if os.path.exists(local_path):
+            try:
+                with open(local_path, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"Failed to read local cache: {e}")
+
+        # 2. Fallback to BigQuery cache
+        logger.info("Local cache missing or corrupt. Reading from BigQuery cache table...")
+        bq_cache = {}
+        try:
+            self._init_bq_cache_table_if_not_exists()
+            table_ref = f"{self.project_id}.{self.cache_dataset_id}.{self.cache_table_id}"
+            query = f"SELECT term_id, hash_val, embedding_json FROM `{table_ref}`"
+            query_job = self._bq_client.query(query)
+            for row in query_job.result():
+                try:
+                    emb = json.loads(row.embedding_json)
+                    bq_cache[row.term_id] = {
+                        "hash_val": row.hash_val,
+                        "embedding": emb
+                    }
+                except Exception:
+                    pass
+            
+            # Save loaded BQ cache locally
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            with open(local_path, 'w') as f:
+                json.dump(bq_cache, f)
+                
+        except Exception as e:
+            logger.warning(f"Failed to load cache from BigQuery: {e}")
+            
+        return bq_cache
+
+    def _save_hybrid_cache(self, cache_data: Dict[str, Dict[str, Any]], new_entries: Dict[str, Dict[str, Any]]):
+        """Saves updated cache data back to both local JSON and BigQuery table."""
+        local_path = self._get_local_cache_path()
+        
+        # 1. Save locally
+        try:
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            with open(local_path, 'w') as f:
+                json.dump(cache_data, f)
+        except Exception as e:
+            logger.warning(f"Failed to write local cache: {e}")
+
+        # 2. Save new entries to BigQuery
+        if not new_entries:
+            return
+
+        try:
+            self._init_bq_cache_table_if_not_exists()
+            table_ref = f"{self.project_id}.{self.cache_dataset_id}.{self.cache_table_id}"
+            
+            # First, delete existing rows for the updated terms to avoid duplicates
+            term_ids_str = ", ".join([f"'{tid}'" for tid in new_entries.keys()])
+            delete_query = f"DELETE FROM `{table_ref}` WHERE term_id IN ({term_ids_str})"
+            self._bq_client.query(delete_query).result()
+            
+            # Insert new rows
+            rows_to_insert = []
+            for term_id, data in new_entries.items():
+                rows_to_insert.append({
+                    "term_id": term_id,
+                    "hash_val": data["hash_val"],
+                    "embedding_json": json.dumps(data["embedding"])
+                })
+            
+            self._bq_client.insert_rows_json(table_ref, rows_to_insert)
+            logger.info(f"Persisted {len(new_entries)} new glossary embeddings to BigQuery cache.")
+        except Exception as e:
+            logger.warning(f"Failed to persist cache to BigQuery: {e}")
+
     def _cache_term_embeddings(self, all_terms: List[Dict[str, Any]]):
-        """Pre-calculates and caches embeddings for all glossary terms."""
+        """Pre-calculates and caches embeddings for all glossary terms using the Hybrid Cache Strategy."""
         if not self._similarity_engine.embedder:
             return
 
+        # Load existing cache
+        cache_data = self._load_hybrid_cache()
+        
         texts_to_embed = []
         term_ids = []
-        for term in all_terms:
-            if term['name'] not in self._similarity_engine.term_embeddings:
-                # Combine name and description for a richer semantic representation
-                text = f"{term['display_name']}: {term.get('description', '')}"
-                texts_to_embed.append(text)
-                term_ids.append(term['name'])
+        new_hashes = []
         
+        # Map existing embeddings into similarity engine
+        engine_embeddings = {}
+        for term_id, data in cache_data.items():
+            engine_embeddings[term_id] = data["embedding"]
+        self._similarity_engine.set_term_embeddings(engine_embeddings)
+
+        for term in all_terms:
+            term_id = term['name']
+            text = f"{term['display_name']}: {term.get('description', '')}"
+            curr_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
+            
+            # Check if we have a valid cached embedding with a matching hash
+            cached_item = cache_data.get(term_id)
+            if not cached_item or cached_item.get("hash_val") != curr_hash:
+                texts_to_embed.append(text)
+                term_ids.append(term_id)
+                new_hashes.append(curr_hash)
+
         if texts_to_embed:
-            logger.info(f"Generating embeddings for {len(texts_to_embed)} glossary terms...")
+            logger.info(f"Generating embeddings for {len(texts_to_embed)} new/updated glossary terms...")
             embs = self._similarity_engine.embedder.get_embeddings(texts_to_embed)
-            new_cache = {term_ids[i]: embs[i] for i in range(len(embs))}
-            self._similarity_engine.term_embeddings.update(new_cache)
+            
+            new_entries = {}
+            for i, term_id in enumerate(term_ids):
+                new_item = {
+                    "hash_val": new_hashes[i],
+                    "embedding": embs[i]
+                }
+                cache_data[term_id] = new_item
+                new_entries[term_id] = new_item
+                # Also update similarity engine
+                self._similarity_engine.term_embeddings[term_id] = embs[i]
+                
+            # Save updated cache
+            self._save_hybrid_cache(cache_data, new_entries)
+
+    def _resolve_project_number(self) -> str:
+        """Dynamically resolves the numeric GCP project number using env variables, Resource Manager API, or compute metadata server."""
+        # 1. Check environment variable first
+        env_val = os.environ.get("GOOGLE_CLOUD_PROJECT_NUMBER")
+        if env_val:
+            return env_val
+
+        # 2. Try to fetch via Cloud Resource Manager API using active credentials
+        try:
+            creds = get_credentials(self.project_id)
+            authed_session = AuthorizedSession(creds)
+            url = f"https://cloudresourcemanager.googleapis.com/v3/projects/{self.project_id}"
+            response = authed_session.get(url)
+            if response.status_code == 200:
+                project_data = response.json()
+                p_num = project_data.get("projectNumber") or project_data.get("name", "").split("/")[-1]
+                if p_num and p_num.isdigit():
+                    logger.info(f"Successfully resolved project number dynamically: {p_num}")
+                    return p_num
+        except Exception as e:
+            logger.debug(f"Could not dynamically resolve project number via Resource Manager API: {e}")
+
+        # 3. Try local Compute Metadata Server fallback (GCE/GKE/Cloud Run/Cloud Shell)
+        try:
+            import requests
+            headers = {"Metadata-Flavor": "Google"}
+            resp = requests.get("http://metadata.google.internal/computeMetadata/v1/project/numeric-project-id", headers=headers, timeout=1)
+            if resp.status_code == 200 and resp.text.strip().isdigit():
+                p_num = resp.text.strip()
+                logger.info(f"Successfully resolved project number from GCE Metadata: {p_num}")
+                return p_num
+        except Exception:
+            pass
+
+        # 4. Safe backward-compatible fallback
+        return "1095607222622"
+
+    def _populate_linked_term_cache(self, dataset_id: str, table_id: str):
+        """Pre-populates the linked terms cache for all columns of a table using LookupEntryLinks (single API call, fully thread-safe)."""
+        if not hasattr(self, '_linked_term_cache'):
+            self._linked_term_cache = {}
+
+        cache_table_key = (dataset_id, table_id)
+        if not hasattr(self, '_populated_tables_cache'):
+            self._populated_tables_cache = set()
+        if not hasattr(self, '_populating_tables'):
+            self._populating_tables = set()
+        if not hasattr(self, '_cv'):
+            self._cv = threading.Condition(self._lock)
+
+        # 1. Thread-safe coordination to prevent concurrent populating of the same table
+        with self._lock:
+            while cache_table_key in self._populating_tables:
+                logger.info(f"Waiting for another thread to populate EntryLink cache for {table_id}...")
+                self._cv.wait()
+                
+            if cache_table_key in self._populated_tables_cache:
+                return
+
+            self._populating_tables.add(cache_table_key)
+
+        self._ensure_initialized()
+        client = self._catalog_client
+        if not client:
+            with self._lock:
+                self._populating_tables.remove(cache_table_key)
+                self._cv.notify_all()
+            return
+
+        # FQNs and project numbers
+        project_number = self._resolve_project_number()
+        
+        # Candidate entries and location parents
+        entry_ids = list(dict.fromkeys([
+            self._get_entry_name(dataset_id, table_id),
+            self._get_entry_name(dataset_id, table_id).replace(self.project_id, project_number)
+        ]))
+        
+        parent_locations = list(dict.fromkeys([
+            f"projects/{self.project_id}/locations/{self.location}",
+            f"projects/{project_number}/locations/{self.location}"
+        ]))
+
+        local_updates = {}
+        for parent in parent_locations:
+            for entry_name in entry_ids:
+                try:
+                    req = dataplex_v1.LookupEntryLinksRequest(
+                        name=parent,
+                        entry=entry_name
+                    )
+                    logger.info(f"Looking up EntryLinks for entry {entry_name} under parent {parent}...")
+                    page_result = client.lookup_entry_links(request=req)
+                    for link in page_result:
+                        source_ref = next((r for r in link.entry_references if r.type_ == dataplex_v1.EntryLink.EntryReference.Type.SOURCE), None)
+                        target_ref = next((r for r in link.entry_references if r.type_ == dataplex_v1.EntryLink.EntryReference.Type.TARGET), None)
+                        
+                        if source_ref and target_ref and source_ref.path.startswith("Schema."):
+                            col_name = source_ref.path.split('.')[-1]
+                            target_term_id = target_ref.name.split('/')[-1]
+                            
+                            local_updates[(dataset_id, table_id, col_name)] = target_term_id
+                            logger.info(f"  [FOUND] Cached link for column {col_name} -> Term ID {target_term_id}")
+                except Exception as ex:
+                    logger.debug(f"lookup_entry_links failed for parent={parent}, entry={entry_name}: {ex}")
+
+        # 2. Thread-safe cache write and cleanup
+        with self._lock:
+            self._linked_term_cache.update(local_updates)
+            self._populated_tables_cache.add(cache_table_key)
+            if cache_table_key in self._populating_tables:
+                self._populating_tables.remove(cache_table_key)
+            self._cv.notify_all()
+
+    def _get_linked_term(self, dataset_id: str, table_id: str, col_name: str) -> Optional[str]:
+        """Fetches the linked glossary term ID for a column using LookupEntryLinks (cached, table-level lookup)."""
+        cache_key = (dataset_id, table_id, col_name)
+        if not hasattr(self, '_linked_term_cache'):
+            self._linked_term_cache = {}
+            
+        # Populate cache for all columns of this table using lookup_entry_links
+        self._populate_linked_term_cache(dataset_id, table_id)
+        
+        with self._lock:
+            return self._linked_term_cache.get(cache_key)
 
     def _check_link_exists(self, dataset_id: str, table_id: str, col_name: str, term_id: str) -> bool:
         """Checks if a specific term is already linked to a column using deterministic IDs."""
-
-        # 1. Check cache first
-        cache_key = (dataset_id, table_id, col_name, term_id)
-        if cache_key in self._link_check_cache:
-            return self._link_check_cache[cache_key]
-
-        client = dataplex_v1.CatalogServiceClient(credentials=get_credentials(self.project_id))
-        
-        # Consistent with apply_terms ID construction
-        clean_column = col_name.replace("_", "-").lower()
-        clean_table = table_id.replace("_", "-").lower()
-        entry_link_id = f"link-{clean_table}-{clean_column}"
-        
-        parent = f"projects/{self.project_id}/locations/{self.location}/entryGroups/@bigquery"
-        link_name = f"{parent}/entryLinks/{entry_link_id}"
-        
-        try:
-            link = client.get_entry_link(name=link_name)
-            # Verify it's the SAME term (optional but safer)
-            target_ref = next((r for r in link.entry_references if r.type_ == dataplex_v1.EntryLink.EntryReference.Type.TARGET), None)
-            if target_ref:
-                # Comparison: Term resource names might differ by project ID vs Number
-                # We check if the unique term identifier (last segment) matches
-                target_term_id = target_ref.name.split('/')[-1]
-                source_term_id = term_id.split('/')[-1]
-                if target_term_id == source_term_id:
-                    self._link_check_cache[cache_key] = True
-                    return True
-        except Exception:
-            # Fallback for UI-created links or restricted list permissions.
-            # If we had list_entry_links permissions, we'd use it here.
-            pass
-        
-        # We return False if no direct deterministic link is found. 
-        # The caller (recommend_terms_for_table) will perform a strict similarity fallback.
-        self._link_check_cache[cache_key] = False
+        linked_term_id = self._get_linked_term(dataset_id, table_id, col_name)
+        if linked_term_id:
+            source_term_id = term_id.split('/')[-1]
+            return linked_term_id == source_term_id
         return False
 
     def _is_column_linked(self, dataset_id: str, table_id: str, col_name: str) -> bool:
         """Checks if a column has ANY glossary term linked to it using deterministic IDs."""
-        
-        # We check for the deterministic ID used in apply_terms
-        client = dataplex_v1.CatalogServiceClient(credentials=get_credentials(self.project_id))
-        
-        clean_column = col_name.replace("_", "-").lower()
-        clean_table = table_id.replace("_", "-").lower()
-        entry_link_id = f"link-{clean_table}-{clean_column}"
-        
-        parent = f"projects/{self.project_id}/locations/{self.location}/entryGroups/@bigquery"
-        link_name = f"{parent}/entryLinks/{entry_link_id}"
-        
-        try:
-            client.get_entry_link(name=link_name)
-            return True
-        except Exception:
-            return False
+        return self._get_linked_term(dataset_id, table_id, col_name) is not None
 
-    def recommend_terms_for_table(self, dataset_id: str, table_id: str, doc_path: Optional[List[str]] = None, context_mode: str = "rag", datastore_id: Optional[str] = None) -> pd.DataFrame:
+    def recommend_terms_for_table(self, dataset_id: str, table_id: str, doc_path: Optional[List[str]] = None, context_mode: str = "rag", datastore_id: Optional[str] = None, min_confidence: float = 0.5) -> pd.DataFrame:
         """
         Fetches recommendations for all columns in a table using Vertex AI Embeddings and Documents.
         """
         self._ensure_initialized()
+        
+
         table_ref = f"{self.project_id}.{dataset_id}.{table_id}"
         table = self._bq_client.get_table(table_ref)
         
@@ -169,14 +416,19 @@ class GlossaryPlugin(BasePlugin):
         col_list = [f.name for f in table.schema]
         upstream_lineage = self._lineage_traverser.get_recursive_column_lineage(lineage_fqn, col_list)
 
-        # 4. Get Recommendations
+        # 4. Get Recommendations (parallelized using ThreadPoolExecutor)
         recommendations = []
-        for i, col_meta in enumerate(col_metas):
+        from concurrent.futures import ThreadPoolExecutor
+        
+        main_token = get_oauth_token()
+        
+        def process_column(args):
+            set_oauth_token(main_token)
+            i, col_meta = args
+            col_recs = []
             col_name = col_meta['name']
             col_path = f"Schema.{col_name}"
             col_emb = col_embeddings[i] if i < len(col_embeddings) else None
-            
-            # Recommendations will check for existing links using _check_link_exists
             
             # A. Lineage-Based Recommendations (Multi-hop)
             lineage_hops = upstream_lineage.get(col_name, [])
@@ -203,60 +455,48 @@ class GlossaryPlugin(BasePlugin):
                         src_description = ""
                         try:
                             src_table_ref = f"{self.project_id}.{src_dataset}.{src_table}"
-                            if not hasattr(self, '_table_cache'): self._table_cache = {}
-                            if src_table_ref not in self._table_cache:
-                                self._table_cache[src_table_ref] = self._bq_client.get_table(src_table_ref)
+                            if not hasattr(self, '_table_cache'):
+                                self._table_cache = {}
+                            with self._lock:
+                                cached_table = self._table_cache.get(src_table_ref)
                             
-                            target_field = next((f for f in self._table_cache[src_table_ref].schema if f.name == src_col), None)
+                            if not cached_table:
+                                thread_client = self._get_bq_client()
+                                cached_table = thread_client.get_table(src_table_ref)
+                                with self._lock:
+                                    self._table_cache[src_table_ref] = cached_table
+                            
+                            target_field = next((f for f in cached_table.schema if f.name == src_col), None)
                             if target_field:
                                 src_description = target_field.description or ""
                         except Exception:
                             pass
 
-                        # HEURISTIC: Check if any of our known terms are linked upstream to this column
+                        # HEURISTIC: Check if any of our known terms are linked upstream to this column via native EntryLinks
                         for term in all_terms:
                             term_id = term['name']
                             found_link = self._check_link_exists(src_dataset, src_table, src_col, term_id)
-                            rationale = f"Propagated via Lineage from {src_entity}"
-                            
-                            # FALLBACK: If no direct link is detected (e.g., UI-created links),
-                            # we ONLY propagate if the term is an extremely strong match for the upstream column
-                            # (> 0.95), effectively a near-exact match. This prevents false positives
-                            # on columns that happen to have lineage but no actual term association.
-                            if not found_link:
-                                upstream_signals = self._similarity_engine.calculate_total_score(
-                                    {"name": src_col, "description": src_description, "type": ""}, 
-                                    term
-                                )
-                                
-                                # STRICT: Only use lineage rationale if it's almost certainly the same term link
-                                # or if the direct match is overwhelming.
-                                if upstream_signals['total'] >= 0.95:
-                                    found_link = True
-                                    rationale = f"Propagated via Lineage (Verified Link)"
-
                             if found_link:
-                                # STRICT CONFIDENCE: Only promote to 1.0 if the lineage mapping itself is strong.
-                                # If the mapping is a weak heuristic (< 0.85), we treat it as moderate confidence.
+                                # High confidence since we have a verified Dataplex Catalog association upstream
                                 final_confidence = 1.0 if hop_confidence >= 0.85 else 0.7
-                                recommendations.append({
+                                col_recs.append({
                                     "Column": col_name,
                                     "Suggested Term": term['display_name'],
                                     "Confidence": final_confidence,
-                                    "Rationale": rationale,
+                                    "Rationale": f"Propagated via Lineage from {src_entity} (Verified Dataplex Catalog Link)",
                                     "Term ID": term_id 
                                 })
                                 break # Found a term for this hop
                         
-                        if recommendations and recommendations[-1]['Column'] == col_name:
+                        if col_recs and col_recs[-1]['Column'] == col_name:
                             break # Already found a term for this column at some hop
                 except Exception as e:
                     logger.warning(f"Failed to check upstream glossary links for {col_name} via {hop.get('source_entity')}: {e}")
 
-            if recommendations and recommendations[-1]['Column'] == col_name:
+            if col_recs and col_recs[-1]['Column'] == col_name:
                 # Found a lineage-based recommendation for this column!
                 # For demo clarity, we prioritize lineage and skip similarity-based suggestions for this column.
-                continue
+                return col_recs
 
             # B. Document Search
             if doc_plugin:
@@ -274,7 +514,7 @@ class GlossaryPlugin(BasePlugin):
                     matched_term = next((t for t in all_terms if t['display_name'] == term_display), None)
                     term_id = matched_term['name'] if matched_term else term_display
                     
-                    recommendations.append({
+                    col_recs.append({
                         "Column": col_name,
                         "Suggested Term": term_display,
                         "Confidence": doc_rec["Confidence"],
@@ -282,7 +522,7 @@ class GlossaryPlugin(BasePlugin):
                         "Term ID": term_id
                     })
                     # Prioritize Document hits over Similarity
-                    continue
+                    return col_recs
                 else:
                     if context_mode == "datastore":
                         logger.info(f"  [NOT FOUND Datastore] No glossary recommendation found for '{col_name}' in Datastore.")
@@ -305,16 +545,26 @@ class GlossaryPlugin(BasePlugin):
                 if f"Business Glossary: {sug['display_name']}" in col_meta.get('description', ''):
                      continue
 
-                recommendations.append({
+                col_recs.append({
                     "Column": col_name,
                     "Suggested Term": sug['display_name'],
                     "Confidence": sug['confidence'],
                     "Rationale": f"Lexical: {sug['signals']['lexical']}, Semantic: {sug['signals']['semantic']}",
                     "Term ID": term_id
                 })
+            return col_recs
+
+        with ThreadPoolExecutor(max_workers=min(len(col_metas), 10)) as executor:
+            results = list(executor.map(process_column, enumerate(col_metas)))
+            
+        for col_recs in results:
+            recommendations.extend(col_recs)
+            
+        # Filter by confidence threshold
+        filtered_recs = [r for r in recommendations if r.get("Confidence", 0.0) >= min_confidence]
         
-        logger.info(f"Generated {len(recommendations)} recommendations for {table_id} after deduplication.")
-        return pd.DataFrame(recommendations)
+        logger.info(f"Generated {len(filtered_recs)} recommendations for {table_id} after filtering by confidence threshold >= {min_confidence}.")
+        return pd.DataFrame(filtered_recs)
 
     def _get_entry_name(self, dataset_id: str, table_id: str):
         entry_id = f"bigquery.googleapis.com/projects/{self.project_id}/datasets/{dataset_id}/tables/{table_id}"
@@ -339,7 +589,7 @@ class GlossaryPlugin(BasePlugin):
             pass
 
         # Pattern 2: Direct Construction with Project Number (Harvested format)
-        project_number = "1095607222622" # Hint for this specific demo environment
+        project_number = self._resolve_project_number()
         term_res_num = term_resource_name.replace(self.project_id, project_number)
         candidate_num = f"{group_prefix}/{term_res_num}"
         try:
@@ -434,38 +684,52 @@ class GlossaryPlugin(BasePlugin):
 
     def scan_for_missing_glossary_terms(self, dataset_id: str) -> pd.DataFrame:
         """
-        Scans all tables in a dataset for columns missing glossary terms using native EntryLinks.
+        Scans all tables in a dataset for columns missing glossary terms using native EntryLinks (parallelized).
         """
         self._ensure_initialized()
         client = dataplex_v1.CatalogServiceClient(credentials=get_credentials(self.project_id))
         
         parent = f"projects/{self.project_id}/locations/{self.location}"
-        
-        # NOTE: list_entry_links is currently restricted in this environment, 
-        # so this scan relies on deterministic EntryLink ID checks.
 
         dataset_ref = self._bq_client.dataset(dataset_id)
-        tables = self._bq_client.list_tables(dataset_ref)
+        tables = list(self._bq_client.list_tables(dataset_ref))
         
         gaps = []
-        for table_item in tables:
-            table_id = table_item.table_id
-            full_table = self._bq_client.get_table(table_item.reference)
-            entry_name = self._get_entry_name(dataset_id, table_id)
-            
-            for field in full_table.schema:
-                # 1. Check for native EntryLink (Deterministic CID)
-                if self._is_column_linked(dataset_id, table_id, field.name):
-                    continue
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        lock = threading.Lock()
+        
+        main_token = get_oauth_token()
 
-                # 2. Check legacy BQ description for backward compatibility
-                desc = field.description or ""
-                if "Business Glossary:" not in desc:
-                    gaps.append({
-                        "Table": table_id,
-                        "Column": field.name,
-                        "Type": field.field_type
-                    })
+        def scan_table(table_item):
+            set_oauth_token(main_token)
+            table_id = table_item.table_id
+            try:
+                thread_client = self._get_bq_client()
+                full_table = thread_client.get_table(table_item.reference)
+                
+                local_gaps = []
+                for field in full_table.schema:
+                    # Check for native EntryLink (Deterministic CID)
+                    if self._is_column_linked(dataset_id, table_id, field.name):
+                        continue
+
+                    # Check legacy BQ description for backward compatibility
+                    desc = field.description or ""
+                    if "Business Glossary:" not in desc:
+                        local_gaps.append({
+                            "Table": table_id,
+                            "Column": field.name,
+                            "Type": field.field_type
+                        })
+                if local_gaps:
+                    with lock:
+                        gaps.extend(local_gaps)
+            except Exception as e:
+                logger.error(f"Error scanning table {table_id} for glossary gaps: {e}")
+
+        with ThreadPoolExecutor(max_workers=min(len(tables), 10)) as executor:
+            list(executor.map(scan_table, tables))
         
         return pd.DataFrame(gaps)
 

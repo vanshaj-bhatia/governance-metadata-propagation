@@ -3,6 +3,7 @@ import os
 import logging
 import pandas as pd
 from typing import List, Dict, Any, Optional
+import threading
 
 # Add adk_integration and dataplex_integration to relative path for plugin execution
 PLUGIN_DIR = os.path.dirname(__file__)
@@ -12,7 +13,7 @@ sys.path.append(os.path.abspath(os.path.join(PLUGIN_DIR, '../../dataplex_integra
 from google.adk.plugins.base_plugin import BasePlugin
 from google.cloud import bigquery, datacatalog_v1, bigquery_datapolicies_v1
 from google.iam.v1 import policy_pb2, iam_policy_pb2
-from context import get_credentials, get_oauth_token
+from context import get_credentials, get_oauth_token, set_oauth_token
 from lineage_propagation import LineageGraphTraverser, TransformationEnricher, SQLFetcher
 from doc_description_plugin import DocDescriptionPlugin
 
@@ -27,6 +28,10 @@ class PolicyTagPlugin(BasePlugin):
         self._sql_fetcher = None
         self._pt_client = None
         self._dp_client = None
+        self._policy_tag_readers_cache = {}
+        self._data_policy_count_cache = {}
+        self._table_schema_cache = {}
+        self._lock = threading.Lock()
 
     def _get_credentials(self):
         return get_credentials(self.project_id)
@@ -58,10 +63,13 @@ class PolicyTagPlugin(BasePlugin):
 
         if not self._dp_client:
             self._dp_client = self._get_dp_client()
+            
+        if not hasattr(self, '_bq_client') or not self._bq_client:
+            self._bq_client = self._get_bq_client()
 
     def scan_for_policy_tags(self, dataset_id: str) -> pd.DataFrame:
         """
-        Scans a dataset for tables/columns with policy tags.
+        Scans a dataset for tables/columns with policy tags (parallelized).
         """
         self._ensure_initialized()
         client = self._get_bq_client()
@@ -70,19 +78,34 @@ class PolicyTagPlugin(BasePlugin):
         tables = list(client.list_tables(dataset_ref))
         policy_tags_data = []
 
-        for table_item in tables:
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        lock = threading.Lock()
+        
+        main_token = get_oauth_token()
+
+        def scan_table(table_item):
+            set_oauth_token(main_token)
             table_ref = f"{dataset_ref}.{table_item.table_id}"
             try:
-                table = client.get_table(table_ref)
+                thread_client = self._get_bq_client()
+                table = thread_client.get_table(table_ref)
+                local_tags = []
                 for field in table.schema:
                     if field.policy_tags:
-                        policy_tags_data.append({
+                        local_tags.append({
                             "Table": table_item.table_id,
                             "Column": field.name,
                             "Policy Tags": ", ".join(field.policy_tags.names)
                         })
+                if local_tags:
+                    with lock:
+                        policy_tags_data.extend(local_tags)
             except Exception as e:
                 logger.error(f"Error accessing {table_ref}: {e}")
+
+        with ThreadPoolExecutor(max_workers=min(len(tables), 10)) as executor:
+            list(executor.map(scan_table, tables))
 
         return pd.DataFrame(policy_tags_data)
 
@@ -111,7 +134,7 @@ class PolicyTagPlugin(BasePlugin):
 
     def preview_policy_tag_propagation(self, dataset_id: str, target_table: str, doc_path: Optional[List[str]] = None, context_mode: str = "rag", datastore_id: Optional[str] = None) -> pd.DataFrame:
         """
-        Recommends policy tag propagation based on lineage and documents.
+        Recommends policy tag propagation based on lineage and documents (parallelized & optimized).
         """
         self._ensure_initialized()
         target_fqn = f"bigquery:{self.project_id}.{dataset_id}.{target_table}"
@@ -134,10 +157,14 @@ class PolicyTagPlugin(BasePlugin):
             
         recommendations = []
         
-        for field in table.schema:
-            # We check even if it already has a policy tag, to see if it matches or needs update
-            # But usually we look for missing ones.
-            
+        # Parallel processing of columns using ThreadPoolExecutor
+        from concurrent.futures import ThreadPoolExecutor
+        
+        main_token = get_oauth_token()
+        
+        def process_field(field):
+            set_oauth_token(main_token)
+            col_recs = []
             logger.info(f"Searching source for column '{field.name}'...")
             # For policy tags, we might only care about direct upstream or a few hops
             lineage = self._lineage_traverser.get_column_lineage(target_fqn, [field.name], depth=0)
@@ -150,7 +177,18 @@ class PolicyTagPlugin(BasePlugin):
                 src_col = source['source_column']
                 
                 try:
-                    src_table = client.get_table(src_entity)
+                    # Cache BQ table fetches thread-safely
+                    with self._lock:
+                        cached_table = self._table_schema_cache.get(src_entity)
+                    
+                    if not cached_table:
+                        thread_client = self._get_bq_client()
+                        cached_table = thread_client.get_table(src_entity)
+                        with self._lock:
+                            self._table_schema_cache[src_entity] = cached_table
+                    
+                    src_table = cached_table
+                    
                     for src_field in src_table.schema:
                         if src_field.name == src_col and src_field.policy_tags:
                             # Found a source with policy tags
@@ -176,11 +214,11 @@ class PolicyTagPlugin(BasePlugin):
                                 logger.info(f"Skipping recommendation for {field.name} - tag already applied.")
                                 continue
 
-                            # Fetch access summary
+                            # Fetch access summary (uses caches internally with lock protection)
                             reader_count = self.get_policy_tag_reader_count(src_tag_names[0]) if src_tag_names else 0
                             masking_count = self.get_policy_tag_data_policy_count(src_tag_names[0]) if src_tag_names else 0
 
-                            recommendations.append({
+                            col_recs.append({
                                 "Target Column": field.name,
                                 "Source Table": src_entity,
                                 "Source Column": src_col,
@@ -207,7 +245,7 @@ class PolicyTagPlugin(BasePlugin):
                         logger.info(f"  [FOUND RAG] Policy Tag recommendation found for '{field.name}'.")
                     # Map display name back to resource path
                     resolved_tag = allowed_tags_map.get(doc_rec["Proposed Tag"], doc_rec["Proposed Tag"])
-                    recommendations.append({
+                    col_recs.append({
                         "Target Column": field.name,
                         "Source Table": "Document",
                         "Source Column": "N/A",
@@ -223,46 +261,69 @@ class PolicyTagPlugin(BasePlugin):
                         logger.info(f"  [NOT FOUND Direct] No policy tag found for '{field.name}' in document.")
                     else:
                         logger.info(f"  [NOT FOUND RAG] No policy tag found for '{field.name}' in document.")
+            return col_recs
 
+        # Process schema fields in parallel
+        with ThreadPoolExecutor(max_workers=min(len(table.schema), 10)) as executor:
+            results = list(executor.map(process_field, table.schema))
+            
+        for col_recs in results:
+            recommendations.extend(col_recs)
+            
         return pd.DataFrame(recommendations)
 
     def get_policy_tag_reader_count(self, policy_tag_id: str) -> int:
-        """Counts members with FineGrainedReader role on a policy tag."""
+        """Counts members with FineGrainedReader role on a policy tag (cached)."""
+        with self._lock:
+            if policy_tag_id in self._policy_tag_readers_cache:
+                return self._policy_tag_readers_cache[policy_tag_id]
+
         self._ensure_initialized()
         try:
             request = iam_policy_pb2.GetIamPolicyRequest(resource=policy_tag_id)
-            policy = self._pt_client.get_iam_policy(request=request)
+            with self._lock:
+                policy = self._pt_client.get_iam_policy(request=request)
             
             readers = set()
             for binding in policy.bindings:
                 if binding.role == "roles/datacatalog.categoryFineGrainedReader":
                     readers.update(binding.members)
-            return len(readers)
+            
+            reader_count = len(readers)
+            with self._lock:
+                self._policy_tag_readers_cache[policy_tag_id] = reader_count
+            return reader_count
         except Exception as e:
             logger.error(f"Failed to count readers for {policy_tag_id}: {e}")
             return 0
 
     def get_policy_tag_data_policy_count(self, policy_tag_id: str) -> int:
-        """Counts BigQuery Data Policies associated with a policy tag."""
+        """Counts BigQuery Data Policies associated with a policy tag (cached)."""
+        with self._lock:
+            if policy_tag_id in self._data_policy_count_cache:
+                return self._data_policy_count_cache[policy_tag_id]
+
         self._ensure_initialized()
         try:
-            # We need to list data policies in the location and filter by policy tag
-            # Format: projects/{project}/locations/{location}
             parent = f"projects/{self.project_id}/locations/{self.location}"
             request = bigquery_datapolicies_v1.ListDataPoliciesRequest(parent=parent)
-            page_result = self._dp_client.list_data_policies(request=request)
+            with self._lock:
+                page_result = self._dp_client.list_data_policies(request=request)
             
             count = 0
             # Normalize target tag ID for comparison (locations/...)
             target_suffix = "/".join(policy_tag_id.split("/")[2:]) if "/" in policy_tag_id else policy_tag_id
             
-            for response in page_result:
-                # Normalize response tag ID
-                res_suffix = "/".join(response.policy_tag.split("/")[2:]) if "/" in response.policy_tag else response.policy_tag
-                
-                if res_suffix == target_suffix:
-                    count += 1
+            with self._lock:
+                for response in page_result:
+                    # Normalize response tag ID
+                    res_suffix = "/".join(response.policy_tag.split("/")[2:]) if "/" in response.policy_tag else response.policy_tag
+                    
+                    if res_suffix == target_suffix:
+                        count += 1
             
+            with self._lock:
+                self._data_policy_count_cache[policy_tag_id] = count
             return count
         except Exception as e:
             logger.error(f"Failed to count data policies for {policy_tag_id}: {e}")

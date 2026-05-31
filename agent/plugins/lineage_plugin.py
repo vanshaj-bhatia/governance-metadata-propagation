@@ -12,7 +12,7 @@ sys.path.append(os.path.abspath(os.path.join(PLUGIN_DIR, '../../dataplex_integra
 from google.adk.plugins.base_plugin import BasePlugin
 from google.oauth2.credentials import Credentials
 from google.cloud import bigquery
-from context import get_oauth_token, get_credentials
+from context import get_oauth_token, get_credentials, set_oauth_token
 from lineage_propagation import LineageGraphTraverser, TransformationEnricher, SQLFetcher
 from insights_connector import DataInsightsClient as DescriptionPropagator
 from doc_description_plugin import DocDescriptionPlugin
@@ -50,11 +50,13 @@ class LineagePlugin(BasePlugin):
             
         if not self._sql_fetcher:
             self._sql_fetcher = SQLFetcher(self.project_id, self.location, credentials=creds)
+            
+        if not hasattr(self, '_bq_client') or not self._bq_client:
+            self._bq_client = self._get_bq_client()
 
     def scan_for_missing_descriptions(self, dataset_id: str) -> pd.DataFrame:
         """
-        Scans a dataset for tables/columns missing descriptions.
-        Returns a DataFrame.
+        Scans a dataset for tables/columns missing descriptions (parallelized).
         """
         self._ensure_initialized()
         client = self._get_bq_client()
@@ -63,19 +65,34 @@ class LineagePlugin(BasePlugin):
         tables = list(client.list_tables(dataset_ref))
         missing_data = []
 
-        for table_item in tables:
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        lock = threading.Lock()
+        
+        main_token = get_oauth_token()
+
+        def scan_table(table_item):
+            set_oauth_token(main_token)
             table_ref = f"{dataset_ref}.{table_item.table_id}"
             try:
-                table = client.get_table(table_ref)
+                thread_client = self._get_bq_client()
+                table = thread_client.get_table(table_ref)
+                local_gaps = []
                 for schema_field in table.schema:
                     if not schema_field.description:
-                        missing_data.append({
+                        local_gaps.append({
                             "Table": table_item.table_id,
                             "Column": schema_field.name,
                             "Type": schema_field.field_type
                         })
+                if local_gaps:
+                    with lock:
+                        missing_data.extend(local_gaps)
             except Exception as e:
                 logger.error(f"Error accessing {table_ref}: {e}")
+
+        with ThreadPoolExecutor(max_workers=min(len(tables), 10)) as executor:
+            list(executor.map(scan_table, tables))
 
         return pd.DataFrame(missing_data)
 
@@ -150,9 +167,9 @@ class LineagePlugin(BasePlugin):
             
         return None
 
-    def preview_propagation(self, dataset_id: str, target_table: str, document_path: Optional[List[str]] = None, context_mode: str = "rag", datastore_id: Optional[str] = None) -> pd.DataFrame:
+    def preview_propagation(self, dataset_id: str, target_table: str, document_path: Optional[List[str]] = None, context_mode: str = "rag", datastore_id: Optional[str] = None, force: bool = False) -> pd.DataFrame:
         """
-        Simulates description propagation for a specific table with multi-hop support and SQL parsing.
+        Simulates description propagation for a specific table with multi-hop support and SQL parsing (parallelized).
         """
         self._ensure_initialized()
         target_fqn = f"bigquery:{self.project_id}.{dataset_id}.{target_table}"
@@ -169,55 +186,60 @@ class LineagePlugin(BasePlugin):
             doc_plugin = DocDescriptionPlugin(self.project_id, self.location)
             doc_plugin.load_document(document_path, mode=context_mode, datastore_id=datastore_id)
             
-        logger.info(f"--- Propagation Preview for {target_table} ---")
+        logger.info(f"--- Parallelized Propagation Preview for {target_table} ---")
+        
+        fields_to_process = []
         for field in table.schema:
-            if field.description:
+            if field.description and not force:
                 logger.debug(f"Skipping column '{field.name}' - already has description.")
                 continue
-                
+            fields_to_process.append(field)
+
+        if not fields_to_process:
+            return pd.DataFrame()
+
+        # Parallel processing of columns using ThreadPoolExecutor
+        from concurrent.futures import ThreadPoolExecutor
+        
+        main_token = get_oauth_token()
+        
+        def process_column(field):
+            set_oauth_token(main_token)
             # A. Lineage Search
             logger.info(f"Searching source for column '{field.name}' via lineage...")
             match = self._find_description_recursive(target_fqn, field.name)
             
+            # B. Document RAG Search
+            doc_rec = None
+            if doc_plugin:
+                doc_rec = doc_plugin.recommend_description_for_column(target_table, field.name, field.field_type)
+                
+            return field.name, match, doc_rec
+
+        with ThreadPoolExecutor(max_workers=min(len(fields_to_process), 10)) as executor:
+            results = list(executor.map(process_column, fields_to_process))
+
+        for col_name, match, doc_rec in results:
             if match:
                 logger.info(f"  [FOUND Lineage] Source: {match['source_entity']}.{match['source_column']}")
                 enriched_desc = TransformationEnricher.enrich_description(
-                    field.name, 
+                    col_name, 
                     match['source_column'], 
                     match['description'],
                     sql_hints=match.get('accumulated_logic', [])
                 )
                 
                 candidates.append({
-                    "Target Column": field.name,
+                    "Target Column": col_name,
                     "Source": match['source_entity'],
                     "Source Column": match['source_column'],
                     "Confidence": match['confidence'],
                     "Proposed Description": enriched_desc,
                     "Type": f"Lineage (Hop {match['hop_depth']})" if match['hop_depth'] > 0 else "Lineage"
                 })
-            else:
-                logger.info(f"  [NOT FOUND Lineage] No source description found for '{field.name}'.")
-                
-            # B. Document RAG Search
-            if doc_plugin:
-                doc_rec = doc_plugin.recommend_description_for_column(target_table, field.name, field.field_type)
-                if doc_rec:
-                    if context_mode == "datastore":
-                        logger.info(f"  [FOUND Datastore] Recommendations found for '{field.name}'.")
-                    elif context_mode == "direct":
-                        logger.info(f"  [FOUND Direct] Recommendations found for '{field.name}'.")
-                    else:
-                        logger.info(f"  [FOUND RAG] Recommendations found for '{field.name}'.")
-                    candidates.append(doc_rec)
-                else:
-                    # Log based on context mode to provide clear context
-                    if context_mode == "datastore":
-                        logger.info(f"  [NOT FOUND Datastore] No recommendation found for '{field.name}' in Datastore.")
-                    elif context_mode == "direct":
-                        logger.info(f"  [NOT FOUND Direct] No recommendation found for '{field.name}' in document.")
-                    else:
-                        logger.info(f"  [NOT FOUND RAG] No recommendation found for '{field.name}' in document.")
+            
+            if doc_rec:
+                candidates.append(doc_rec)
 
         if not candidates:
             logger.warning(f"No propagation candidates found for {target_table}.")
