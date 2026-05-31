@@ -22,11 +22,13 @@ from doc_description_plugin import DocDescriptionPlugin
 logger = logging.getLogger(__name__)
 
 class GlossaryPlugin(BasePlugin):
-    def __init__(self, project_id: str, location: str = "europe-west1"):
+    def __init__(self, project_id: str, location: str = "europe-west1", cache_dataset_id: Optional[str] = None, cache_table_id: Optional[str] = None):
         super().__init__(name="glossary_plugin")
         self.project_id = project_id
         self.location = location
         self.dataset_id = os.environ.get("BIGQUERY_DATASET_ID", "retail_synthetic_data")
+        self.cache_dataset_id = cache_dataset_id or os.environ.get("GLOSSARY_CACHE_DATASET_ID", self.dataset_id)
+        self.cache_table_id = cache_table_id or os.environ.get("GLOSSARY_CACHE_TABLE_ID", "glossary_embeddings_cache")
         self._glossary_client = None
         self._similarity_engine = None
         self._bq_client = None
@@ -83,7 +85,7 @@ class GlossaryPlugin(BasePlugin):
     def _init_bq_cache_table_if_not_exists(self):
         """Creates the glossary_embeddings_cache table in BigQuery if missing."""
         client = self._bq_client
-        table_ref = f"{self.project_id}.{self.dataset_id}.glossary_embeddings_cache"
+        table_ref = f"{self.project_id}.{self.cache_dataset_id}.{self.cache_table_id}"
         try:
             client.get_table(table_ref)
         except Exception:
@@ -115,7 +117,7 @@ class GlossaryPlugin(BasePlugin):
         bq_cache = {}
         try:
             self._init_bq_cache_table_if_not_exists()
-            table_ref = f"{self.project_id}.{self.dataset_id}.glossary_embeddings_cache"
+            table_ref = f"{self.project_id}.{self.cache_dataset_id}.{self.cache_table_id}"
             query = f"SELECT term_id, hash_val, embedding_json FROM `{table_ref}`"
             query_job = self._bq_client.query(query)
             for row in query_job.result():
@@ -156,7 +158,7 @@ class GlossaryPlugin(BasePlugin):
 
         try:
             self._init_bq_cache_table_if_not_exists()
-            table_ref = f"{self.project_id}.{self.dataset_id}.glossary_embeddings_cache"
+            table_ref = f"{self.project_id}.{self.cache_dataset_id}.{self.cache_table_id}"
             
             # First, delete existing rows for the updated terms to avoid duplicates
             term_ids_str = ", ".join([f"'{tid}'" for tid in new_entries.keys()])

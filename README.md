@@ -152,6 +152,34 @@ When using the `--document` flag with the `apply`, `policy-propagate`, or `gloss
 
 ---
 
+## ⚙️ Glossary Cache Configuration
+
+In enterprise governance workflows, stewards often scan read-only production datasets (where they lack `bigquery.dataEditor` permissions). To optimize glossary mapping recommendations, the steward needs a cache. The system supports redirecting the business glossary embeddings cache to a dedicated writable dataset:
+
+### 1. Web UI (Gradio)
+Open the **Global Environment Settings** accordion at the top of the dashboard:
+- **Glossary Cache Dataset ID**: The dataset where you want the `glossary_embeddings_cache` table to be created (e.g., a separate sandbox or metadata dataset).
+- **Glossary Cache Table ID**: Custom table name for storing cached embeddings (defaults to `glossary_embeddings_cache`).
+
+### 2. CLI Flags
+You can pass the cache location explicitly as command line arguments to any command:
+```bash
+python3 steward_cli.py glossary-recommend \
+  --dataset prod_readonly_dataset \
+  --table transactions \
+  --cache-dataset metadata_sandbox_dataset \
+  --cache-table my_glossary_cache
+```
+
+### 3. Environment Variables
+You can also set these values in a `.env` file or in your shell:
+* `GLOSSARY_CACHE_DATASET_ID`: Redirects the cache table to a separate BigQuery dataset.
+* `GLOSSARY_CACHE_TABLE_ID`: Custom name for the BigQuery cache table.
+
+> 💡 *Note: If BigQuery cache initialization fails due to write permissions, the plugin automatically falls back to a local JSON file cache (`scratch/glossary_embeddings_cache.json`) transparently, ensuring zero disruption to the user experience.*
+
+---
+
 ## 🧩 Project Modules
 
 | Module | Location | Description |

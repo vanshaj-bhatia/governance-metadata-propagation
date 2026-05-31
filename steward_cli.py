@@ -93,6 +93,8 @@ def main():
     parser.add_argument("--location", default="europe-west1", help="GCP Location")
     parser.add_argument("--yes", "-y", action="store_true", help="Automatically approve all prompts")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging to file")
+    parser.add_argument("--cache-dataset", dest="cache_dataset", default=os.environ.get("GLOSSARY_CACHE_DATASET_ID"), help="GCP BigQuery dataset for glossary embeddings cache")
+    parser.add_argument("--cache-table", dest="cache_table", default=os.environ.get("GLOSSARY_CACHE_TABLE_ID"), help="GCP BigQuery table name for glossary embeddings cache")
     
     subparsers = parser.add_subparsers(dest="command", help="Commands")
     
@@ -172,7 +174,12 @@ def main():
     root_logger.addHandler(ch)
     
     plugin = LineagePlugin(args.project, args.location)
-    glossary_plugin = GlossaryPlugin(args.project, args.location)
+    glossary_plugin = GlossaryPlugin(
+        args.project, 
+        args.location, 
+        cache_dataset_id=args.cache_dataset, 
+        cache_table_id=args.cache_table
+    )
     policy_plugin = PolicyTagPlugin(args.project, args.location)
     doc_plugin = DocDescriptionPlugin(args.project, args.location)
     
