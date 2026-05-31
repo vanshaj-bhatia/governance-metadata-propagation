@@ -12,7 +12,7 @@ sys.path.append(os.path.abspath(os.path.join(PLUGIN_DIR, '../../dataplex_integra
 from google.adk.plugins.base_plugin import BasePlugin
 from google.oauth2.credentials import Credentials
 from google.cloud import bigquery
-from context import get_oauth_token, get_credentials
+from context import get_oauth_token, get_credentials, set_oauth_token
 from lineage_propagation import LineageGraphTraverser, TransformationEnricher, SQLFetcher
 from insights_connector import DataInsightsClient as DescriptionPropagator
 from doc_description_plugin import DocDescriptionPlugin
@@ -50,11 +50,13 @@ class LineagePlugin(BasePlugin):
             
         if not self._sql_fetcher:
             self._sql_fetcher = SQLFetcher(self.project_id, self.location, credentials=creds)
+            
+        if not hasattr(self, '_bq_client') or not self._bq_client:
+            self._bq_client = self._get_bq_client()
 
     def scan_for_missing_descriptions(self, dataset_id: str) -> pd.DataFrame:
         """
-        Scans a dataset for tables/columns missing descriptions.
-        Returns a DataFrame.
+        Scans a dataset for tables/columns missing descriptions (parallelized).
         """
         self._ensure_initialized()
         client = self._get_bq_client()
@@ -63,19 +65,34 @@ class LineagePlugin(BasePlugin):
         tables = list(client.list_tables(dataset_ref))
         missing_data = []
 
-        for table_item in tables:
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        lock = threading.Lock()
+        
+        main_token = get_oauth_token()
+
+        def scan_table(table_item):
+            set_oauth_token(main_token)
             table_ref = f"{dataset_ref}.{table_item.table_id}"
             try:
-                table = client.get_table(table_ref)
+                thread_client = self._get_bq_client()
+                table = thread_client.get_table(table_ref)
+                local_gaps = []
                 for schema_field in table.schema:
                     if not schema_field.description:
-                        missing_data.append({
+                        local_gaps.append({
                             "Table": table_item.table_id,
                             "Column": schema_field.name,
                             "Type": schema_field.field_type
                         })
+                if local_gaps:
+                    with lock:
+                        missing_data.extend(local_gaps)
             except Exception as e:
                 logger.error(f"Error accessing {table_ref}: {e}")
+
+        with ThreadPoolExecutor(max_workers=min(len(tables), 10)) as executor:
+            list(executor.map(scan_table, tables))
 
         return pd.DataFrame(missing_data)
 
@@ -184,7 +201,10 @@ class LineagePlugin(BasePlugin):
         # Parallel processing of columns using ThreadPoolExecutor
         from concurrent.futures import ThreadPoolExecutor
         
+        main_token = get_oauth_token()
+        
         def process_column(field):
+            set_oauth_token(main_token)
             # A. Lineage Search
             logger.info(f"Searching source for column '{field.name}' via lineage...")
             match = self._find_description_recursive(target_fqn, field.name)

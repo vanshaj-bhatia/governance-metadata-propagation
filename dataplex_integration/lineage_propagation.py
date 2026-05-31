@@ -23,39 +23,46 @@ class SQLFetcher:
         self.location = location
         self.client = bigquery.Client(project=project_id, credentials=credentials)
         self._sql_cache = {} # Cache: (dataset_id, table_id) -> query_text
+        self._lock = threading.Lock()
 
     def get_transformation_sql(self, dataset_id: str, table_id: str) -> Optional[str]:
-        """Queries Information Schema for the last SQL job that updated this table (cached)."""
+        """Queries Information Schema for the last SQL job that updated this table (cached & thread-safe)."""
         cache_key = (dataset_id, table_id)
-        if cache_key in self._sql_cache:
-            return self._sql_cache[cache_key]
+        with self._lock:
+            if cache_key in self._sql_cache:
+                return self._sql_cache[cache_key]
 
-        # NOTE: BigQuery Information Schema Jobs views are regional.
-        # We must query the specific region where the processing happened.
-        region = self.location.split('-')[0] # approximate region mapping
-        if 'europe' in self.location: region = 'europe-west1' # handle europe specific multi-region/regional variation
-        
-        query = f"""
-        SELECT query
-        FROM `{self.project_id}.region-{region}.INFORMATION_SCHEMA.JOBS_BY_PROJECT`
-        WHERE destination_table.table_id = '{table_id}'
-        AND destination_table.dataset_id = '{dataset_id}'
-        AND statement_type IN ('CREATE_TABLE_AS_SELECT', 'INSERT', 'MERGE', 'UPDATE')
-        ORDER BY creation_time DESC
-        LIMIT 1
-        """
-        try:
-            query_job = self.client.query(query)
-            results = list(query_job.result())
-            if results:
-                sql_query = results[0].query
-                self._sql_cache[cache_key] = sql_query
-                return sql_query
-        except Exception as e:
-            logger.warning(f"Failed to fetch SQL for {table_id}: {e}")
-        
-        self._sql_cache[cache_key] = None
-        return None
+        with self._lock:
+            # Double-checked locking pattern
+            if cache_key in self._sql_cache:
+                return self._sql_cache[cache_key]
+
+            # NOTE: BigQuery Information Schema Jobs views are regional.
+            # We must query the specific region where the processing happened.
+            region = self.location.split('-')[0] # approximate region mapping
+            if 'europe' in self.location: region = 'europe-west1' # handle europe specific multi-region/regional variation
+            
+            query = f"""
+            SELECT query
+            FROM `{self.project_id}.region-{region}.INFORMATION_SCHEMA.JOBS_BY_PROJECT`
+            WHERE destination_table.table_id = '{table_id}'
+            AND destination_table.dataset_id = '{dataset_id}'
+            AND statement_type IN ('CREATE_TABLE_AS_SELECT', 'INSERT', 'MERGE', 'UPDATE')
+            ORDER BY creation_time DESC
+            LIMIT 1
+            """
+            try:
+                query_job = self.client.query(query)
+                results = list(query_job.result())
+                if results:
+                    sql_query = results[0].query
+                    self._sql_cache[cache_key] = sql_query
+                    return sql_query
+            except Exception as e:
+                logger.warning(f"Failed to fetch SQL for {table_id}: {e}")
+            
+            self._sql_cache[cache_key] = None
+            return None
 
 class TransformationEnricher:
     """Provides semantic enrichment logic for propagated metadata."""
@@ -239,14 +246,23 @@ class TransformationEnricher:
         return description.strip()
 
 class LineageGraphTraverser:
+    # Class-level lineage cache shared across all instances/plugins
+    _global_lineage_cache = {}
+    _global_lock = threading.Lock()
+
+    @classmethod
+    def clear_global_cache(cls):
+        """Clears the unified shared lineage cache."""
+        with cls._global_lock:
+            cls._global_lineage_cache.clear()
+            logger.info("Unified Lineage Cache cleared successfully.")
+
     def __init__(self, project_id, location, token: Optional[str] = None):
         self.project_id = project_id
         self.location = location
         self.token = token
         self.client = datacatalog_lineage_v1.LineageClient()
         self.knowledge_insights = []
-        self._lineage_cache = {} # Cache: (target_entry_name, col) -> list of matches
-        self._lock = threading.Lock()
 
     def load_knowledge_insights(self, json_path):
         """Loads Knowledge Engine insights (schema relationships) from JSON."""
@@ -338,9 +354,9 @@ class LineageGraphTraverser:
 
         for col in target_columns:
             cache_key = (target_entry_name, col)
-            with self._lock:
-                if cache_key in self._lineage_cache:
-                    column_mappings[col] = self._lineage_cache[cache_key]
+            with self._global_lock:
+                if cache_key in self._global_lineage_cache:
+                    column_mappings[col] = self._global_lineage_cache[cache_key]
                     continue
 
             logger.info(f"Searching upstream column lineage for {target_entry_name}.{col} (depth {depth})...")
@@ -348,8 +364,8 @@ class LineageGraphTraverser:
                 links = self._search_links(target_entry_name, [col], "target")
                 if not links:
                     column_mappings[col] = []
-                    with self._lock:
-                        self._lineage_cache[cache_key] = []
+                    with self._global_lock:
+                        self._global_lineage_cache[cache_key] = []
                     continue
 
                 matches = []
@@ -386,12 +402,12 @@ class LineageGraphTraverser:
                     # Sort candidates by confidence
                     sorted_matches = sorted(matches, key=lambda x: x['confidence'], reverse=True)
                     column_mappings[col] = sorted_matches
-                    with self._lock:
-                        self._lineage_cache[cache_key] = sorted_matches
+                    with self._global_lock:
+                        self._global_lineage_cache[cache_key] = sorted_matches
                 else:
                     column_mappings[col] = []
-                    with self._lock:
-                        self._lineage_cache[cache_key] = []
+                    with self._global_lock:
+                        self._global_lineage_cache[cache_key] = []
 
             except Exception as e:
                 logger.warning(f"Failed to fetch upstream lineage for column {col}: {e}")

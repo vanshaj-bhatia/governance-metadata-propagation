@@ -1,6 +1,10 @@
+import os
+# Force gRPC to use native IPv4 resolver to bypass macOS IPv6 lookup hangs/timeouts
+os.environ["GRPC_DNS_RESOLVER"] = "native"
+os.environ["GRPC_IPv6"] = "off"
+
 import argparse
 import sys
-import os
 import pandas as pd
 from typing import List, Dict, Any
 

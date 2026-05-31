@@ -1,8 +1,12 @@
+import os
+# Force gRPC to use native IPv4 resolver to bypass macOS IPv6 lookup hangs/timeouts
+os.environ["GRPC_DNS_RESOLVER"] = "native"
+os.environ["GRPC_IPv6"] = "off"
+
 import gradio as gr
 import fastapi
 from fastapi.responses import RedirectResponse
 import sys
-import os
 import pandas as pd
 import logging
 from authlib.integrations.starlette_client import OAuth
@@ -47,6 +51,12 @@ DEFAULT_LOCATION = "europe-west1"
 DEFAULT_DATASET_ID = os.environ.get("BIGQUERY_DATASET_ID", "retail_synthetic_data")
 
 KNOWLEDGE_JSON_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "../knowledge_insights.json"))
+
+def handle_refresh_lineage_cache():
+    from lineage_propagation import LineageGraphTraverser
+    LineageGraphTraverser.clear_global_cache()
+    gr.Info("Unified Lineage Cache cleared successfully!")
+    return "Unified Lineage Cache cleared."
 
 def get_plugin(project_id, location):
     return LineagePlugin(project_id, location, knowledge_json_path=KNOWLEDGE_JSON_PATH)
@@ -329,14 +339,15 @@ def deselect_all_lineage(df):
         df["Select"] = [False] * len(df)
     return df
 
-def get_glossary_recommendations(project_id, location, dataset_id, table_id, request: gr.Request = None):
+def get_glossary_recommendations(project_id, location, dataset_id, table_id, min_confidence=0.5, request: gr.Request = None):
+    logger.info(f"get_glossary_recommendations called with project_id={project_id}, location={location}, dataset_id={dataset_id}, table_id={table_id}, min_confidence={min_confidence} (type: {type(min_confidence)})")
     token = get_token_from_session(request)
     set_oauth_token(token)
     try:
         plugin = GlossaryPlugin(project_id, location)
-        df = plugin.recommend_terms_for_table(dataset_id, table_id)
+        df = plugin.recommend_terms_for_table(dataset_id, table_id, min_confidence=float(min_confidence))
         if df.empty:
-            gr.Info(f"No glossary recommendations found for {table_id}.")
+            gr.Info(f"No glossary recommendations found for {table_id} with confidence >= {min_confidence}.")
             return pd.DataFrame(columns=["Select", "Column", "Suggested Term", "Confidence", "Rationale", "Term ID"])
         df.insert(0, "Select", [True] * len(df))
         return df
@@ -524,6 +535,9 @@ with gr.Blocks(title="Governance on Auto-pilot") as demo:
             with gr.Row():
                 config_project = gr.Textbox(label="Project ID", value=DEFAULT_PROJECT_ID)
                 config_location = gr.Textbox(label="Location", value=DEFAULT_LOCATION)
+                refresh_lineage_btn = gr.Button("🔄 Refresh Lineage Cache", variant="secondary", size="sm", elem_classes=["gr-button-secondary"])
+            
+            refresh_lineage_btn.click(handle_refresh_lineage_cache, inputs=None, outputs=None)
     
         with gr.Tabs():
             with gr.TabItem("Dashboard"):
@@ -639,6 +653,7 @@ with gr.Blocks(title="Governance on Auto-pilot") as demo:
                     
                     with gr.Row():
                         glossary_table = gr.Textbox(label="Target Table", value="customers")
+                        confidence_slider = gr.Slider(minimum=0.0, maximum=1.0, value=0.5, step=0.05, label="Minimum Confidence Threshold", info="Filter out weak recommendations")
                     
                     recommend_btn = gr.Button("Get Glossary Recommendations", variant="primary", elem_classes=["gr-button-primary"])
                 
@@ -666,7 +681,7 @@ with gr.Blocks(title="Governance on Auto-pilot") as demo:
                     lambda: "", outputs=[glossary_apply_result]
                 ).then(
                     get_glossary_recommendations,
-                    inputs=[config_project, config_location, global_dataset, glossary_table],
+                    inputs=[config_project, config_location, global_dataset, glossary_table, confidence_slider],
                     outputs=recommendations_view
                 )
                 
