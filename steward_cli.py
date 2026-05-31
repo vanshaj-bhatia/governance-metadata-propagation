@@ -110,6 +110,7 @@ def main():
     apply_parser.add_argument("--document", nargs="+", help="Path to unstructured document(s) to influence descriptions")
     apply_parser.add_argument("--context-mode", choices=["direct", "rag", "datastore"], default="rag", help="Mode to process document context")
     apply_parser.add_argument("--datastore-id", help="Vertex AI Search DataStore ID (required for datastore mode)")
+    apply_parser.add_argument("--force", action="store_true", help="Force propagation analysis even for columns that already have descriptions")
     
     # Glossary recommend command
     glossary_parser = subparsers.add_parser("glossary-recommend", help="Recommend glossary terms for a table")
@@ -211,7 +212,8 @@ def main():
             args.table, 
             document_path=args.document, 
             context_mode=args.context_mode, 
-            datastore_id=args.datastore_id
+            datastore_id=args.datastore_id,
+            force=args.force
         )
         
         if df.empty:

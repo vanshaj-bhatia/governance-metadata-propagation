@@ -167,7 +167,7 @@ class LineagePlugin(BasePlugin):
             
         return None
 
-    def preview_propagation(self, dataset_id: str, target_table: str, document_path: Optional[List[str]] = None, context_mode: str = "rag", datastore_id: Optional[str] = None) -> pd.DataFrame:
+    def preview_propagation(self, dataset_id: str, target_table: str, document_path: Optional[List[str]] = None, context_mode: str = "rag", datastore_id: Optional[str] = None, force: bool = False) -> pd.DataFrame:
         """
         Simulates description propagation for a specific table with multi-hop support and SQL parsing (parallelized).
         """
@@ -190,7 +190,7 @@ class LineagePlugin(BasePlugin):
         
         fields_to_process = []
         for field in table.schema:
-            if field.description:
+            if field.description and not force:
                 logger.debug(f"Skipping column '{field.name}' - already has description.")
                 continue
             fields_to_process.append(field)
