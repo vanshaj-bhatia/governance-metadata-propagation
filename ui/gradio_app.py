@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 # Fetch Project ID from environment or default
 DEFAULT_PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT", "governance-agent")
 DEFAULT_LOCATION = "europe-west1"
-DEFAULT_DATASET_ID = os.environ.get("BIGQUERY_DATASET_ID", "retail_syn_data")
+DEFAULT_DATASET_ID = os.environ.get("BIGQUERY_DATASET_ID", "retail_synthetic_data")
 
 KNOWLEDGE_JSON_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "../knowledge_insights.json"))
 
@@ -795,6 +795,8 @@ if __name__ == "__main__":
         return RedirectResponse(url="/")
 
     app = gr.mount_gradio_app(main_app, demo, path="/")
+
+
 
     import uvicorn
     host = os.environ.get("HOST", "0.0.0.0")

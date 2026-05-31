@@ -25,6 +25,7 @@ class GlossaryPlugin(BasePlugin):
         self._glossary_client = None
         self._similarity_engine = None
         self._bq_client = None
+        self._catalog_client = None
         self._lineage_traverser = None
         self._link_check_cache = {} # Cache for _check_link_exists: (dataset, table, col, term) -> bool
 
@@ -37,6 +38,12 @@ class GlossaryPlugin(BasePlugin):
             self._similarity_engine = SimilarityEngine(self.project_id, location="us-central1", credentials=creds)
         if not self._bq_client:
             self._bq_client = bigquery.Client(project=self.project_id, credentials=creds)
+        if not self._catalog_client:
+            try:
+                self._catalog_client = dataplex_v1.CatalogServiceClient(credentials=creds)
+            except Exception as e:
+                logger.warning(f"Failed to initialize CatalogServiceClient (Dataplex Catalog): {e}")
+                self._catalog_client = None
         if not self._lineage_traverser:
             token = get_oauth_token()
             self._lineage_traverser = LineageGraphTraverser(self.project_id, self.location, token=token)
@@ -61,70 +68,91 @@ class GlossaryPlugin(BasePlugin):
             new_cache = {term_ids[i]: embs[i] for i in range(len(embs))}
             self._similarity_engine.term_embeddings.update(new_cache)
 
+    def _populate_linked_term_cache(self, dataset_id: str, table_id: str):
+        """Pre-populates the linked terms cache for all columns of a table using LookupEntryLinks (single API call)."""
+        if not hasattr(self, '_linked_term_cache'):
+            self._linked_term_cache = {}
+
+        cache_table_key = (dataset_id, table_id)
+        if not hasattr(self, '_populated_tables_cache'):
+            self._populated_tables_cache = set()
+
+        if cache_table_key in self._populated_tables_cache:
+            return
+
+        self._ensure_initialized()
+        client = self._catalog_client
+        if not client:
+            return
+
+        # FQNs and project numbers
+        project_number = "1095607222622"
+        
+        # Candidate entries and location parents
+        entry_ids = [
+            self._get_entry_name(dataset_id, table_id),
+            self._get_entry_name(dataset_id, table_id).replace(self.project_id, project_number)
+        ]
+        
+        parent_locations = [
+            f"projects/{self.project_id}/locations/{self.location}",
+            f"projects/{project_number}/locations/{self.location}"
+        ]
+
+        for parent in parent_locations:
+            for entry_name in entry_ids:
+                try:
+                    req = dataplex_v1.LookupEntryLinksRequest(
+                        name=parent,
+                        entry=entry_name
+                    )
+                    logger.info(f"Looking up EntryLinks for entry {entry_name} under parent {parent}...")
+                    page_result = client.lookup_entry_links(request=req)
+                    for link in page_result:
+                        source_ref = next((r for r in link.entry_references if r.type_ == dataplex_v1.EntryLink.EntryReference.Type.SOURCE), None)
+                        target_ref = next((r for r in link.entry_references if r.type_ == dataplex_v1.EntryLink.EntryReference.Type.TARGET), None)
+                        
+                        if source_ref and target_ref and source_ref.path.startswith("Schema."):
+                            col_name = source_ref.path.split('.')[-1]
+                            target_term_id = target_ref.name.split('/')[-1]
+                            
+                            self._linked_term_cache[(dataset_id, table_id, col_name)] = target_term_id
+                            logger.info(f"  [FOUND] Cached link for column {col_name} -> Term ID {target_term_id}")
+                except Exception as ex:
+                    logger.debug(f"lookup_entry_links failed for parent={parent}, entry={entry_name}: {ex}")
+
+        self._populated_tables_cache.add(cache_table_key)
+
+    def _get_linked_term(self, dataset_id: str, table_id: str, col_name: str) -> Optional[str]:
+        """Fetches the linked glossary term ID for a column using LookupEntryLinks (cached, table-level lookup)."""
+        cache_key = (dataset_id, table_id, col_name)
+        if not hasattr(self, '_linked_term_cache'):
+            self._linked_term_cache = {}
+            
+        # Populate cache for all columns of this table using lookup_entry_links
+        self._populate_linked_term_cache(dataset_id, table_id)
+        
+        return self._linked_term_cache.get(cache_key)
+
     def _check_link_exists(self, dataset_id: str, table_id: str, col_name: str, term_id: str) -> bool:
         """Checks if a specific term is already linked to a column using deterministic IDs."""
-
-        # 1. Check cache first
-        cache_key = (dataset_id, table_id, col_name, term_id)
-        if cache_key in self._link_check_cache:
-            return self._link_check_cache[cache_key]
-
-        client = dataplex_v1.CatalogServiceClient(credentials=get_credentials(self.project_id))
-        
-        # Consistent with apply_terms ID construction
-        clean_column = col_name.replace("_", "-").lower()
-        clean_table = table_id.replace("_", "-").lower()
-        entry_link_id = f"link-{clean_table}-{clean_column}"
-        
-        parent = f"projects/{self.project_id}/locations/{self.location}/entryGroups/@bigquery"
-        link_name = f"{parent}/entryLinks/{entry_link_id}"
-        
-        try:
-            link = client.get_entry_link(name=link_name)
-            # Verify it's the SAME term (optional but safer)
-            target_ref = next((r for r in link.entry_references if r.type_ == dataplex_v1.EntryLink.EntryReference.Type.TARGET), None)
-            if target_ref:
-                # Comparison: Term resource names might differ by project ID vs Number
-                # We check if the unique term identifier (last segment) matches
-                target_term_id = target_ref.name.split('/')[-1]
-                source_term_id = term_id.split('/')[-1]
-                if target_term_id == source_term_id:
-                    self._link_check_cache[cache_key] = True
-                    return True
-        except Exception:
-            # Fallback for UI-created links or restricted list permissions.
-            # If we had list_entry_links permissions, we'd use it here.
-            pass
-        
-        # We return False if no direct deterministic link is found. 
-        # The caller (recommend_terms_for_table) will perform a strict similarity fallback.
-        self._link_check_cache[cache_key] = False
+        linked_term_id = self._get_linked_term(dataset_id, table_id, col_name)
+        if linked_term_id:
+            source_term_id = term_id.split('/')[-1]
+            return linked_term_id == source_term_id
         return False
 
     def _is_column_linked(self, dataset_id: str, table_id: str, col_name: str) -> bool:
         """Checks if a column has ANY glossary term linked to it using deterministic IDs."""
-        
-        # We check for the deterministic ID used in apply_terms
-        client = dataplex_v1.CatalogServiceClient(credentials=get_credentials(self.project_id))
-        
-        clean_column = col_name.replace("_", "-").lower()
-        clean_table = table_id.replace("_", "-").lower()
-        entry_link_id = f"link-{clean_table}-{clean_column}"
-        
-        parent = f"projects/{self.project_id}/locations/{self.location}/entryGroups/@bigquery"
-        link_name = f"{parent}/entryLinks/{entry_link_id}"
-        
-        try:
-            client.get_entry_link(name=link_name)
-            return True
-        except Exception:
-            return False
+        return self._get_linked_term(dataset_id, table_id, col_name) is not None
 
     def recommend_terms_for_table(self, dataset_id: str, table_id: str, doc_path: Optional[List[str]] = None, context_mode: str = "rag", datastore_id: Optional[str] = None) -> pd.DataFrame:
         """
         Fetches recommendations for all columns in a table using Vertex AI Embeddings and Documents.
         """
         self._ensure_initialized()
+        
+
         table_ref = f"{self.project_id}.{dataset_id}.{table_id}"
         table = self._bq_client.get_table(table_ref)
         
@@ -213,37 +241,18 @@ class GlossaryPlugin(BasePlugin):
                         except Exception:
                             pass
 
-                        # HEURISTIC: Check if any of our known terms are linked upstream to this column
+                        # HEURISTIC: Check if any of our known terms are linked upstream to this column via native EntryLinks
                         for term in all_terms:
                             term_id = term['name']
                             found_link = self._check_link_exists(src_dataset, src_table, src_col, term_id)
-                            rationale = f"Propagated via Lineage from {src_entity}"
-                            
-                            # FALLBACK: If no direct link is detected (e.g., UI-created links),
-                            # we ONLY propagate if the term is an extremely strong match for the upstream column
-                            # (> 0.95), effectively a near-exact match. This prevents false positives
-                            # on columns that happen to have lineage but no actual term association.
-                            if not found_link:
-                                upstream_signals = self._similarity_engine.calculate_total_score(
-                                    {"name": src_col, "description": src_description, "type": ""}, 
-                                    term
-                                )
-                                
-                                # STRICT: Only use lineage rationale if it's almost certainly the same term link
-                                # or if the direct match is overwhelming.
-                                if upstream_signals['total'] >= 0.95:
-                                    found_link = True
-                                    rationale = f"Propagated via Lineage (Verified Link)"
-
                             if found_link:
-                                # STRICT CONFIDENCE: Only promote to 1.0 if the lineage mapping itself is strong.
-                                # If the mapping is a weak heuristic (< 0.85), we treat it as moderate confidence.
+                                # High confidence since we have a verified Dataplex Catalog association upstream
                                 final_confidence = 1.0 if hop_confidence >= 0.85 else 0.7
                                 recommendations.append({
                                     "Column": col_name,
                                     "Suggested Term": term['display_name'],
                                     "Confidence": final_confidence,
-                                    "Rationale": rationale,
+                                    "Rationale": f"Propagated via Lineage from {src_entity} (Verified Dataplex Catalog Link)",
                                     "Term ID": term_id 
                                 })
                                 break # Found a term for this hop

@@ -8,6 +8,7 @@ from google.api_core import exceptions
 from google.cloud import bigquery
 import re
 from typing import List, Dict, Any, Optional
+import threading
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,9 +22,14 @@ class SQLFetcher:
         self.project_id = project_id
         self.location = location
         self.client = bigquery.Client(project=project_id, credentials=credentials)
+        self._sql_cache = {} # Cache: (dataset_id, table_id) -> query_text
 
     def get_transformation_sql(self, dataset_id: str, table_id: str) -> Optional[str]:
-        """Queries Information Schema for the last SQL job that updated this table."""
+        """Queries Information Schema for the last SQL job that updated this table (cached)."""
+        cache_key = (dataset_id, table_id)
+        if cache_key in self._sql_cache:
+            return self._sql_cache[cache_key]
+
         # NOTE: BigQuery Information Schema Jobs views are regional.
         # We must query the specific region where the processing happened.
         region = self.location.split('-')[0] # approximate region mapping
@@ -42,9 +48,13 @@ class SQLFetcher:
             query_job = self.client.query(query)
             results = list(query_job.result())
             if results:
-                return results[0].query
+                sql_query = results[0].query
+                self._sql_cache[cache_key] = sql_query
+                return sql_query
         except Exception as e:
             logger.warning(f"Failed to fetch SQL for {table_id}: {e}")
+        
+        self._sql_cache[cache_key] = None
         return None
 
 class TransformationEnricher:
@@ -235,6 +245,8 @@ class LineageGraphTraverser:
         self.token = token
         self.client = datacatalog_lineage_v1.LineageClient()
         self.knowledge_insights = []
+        self._lineage_cache = {} # Cache: (target_entry_name, col) -> list of matches
+        self._lock = threading.Lock()
 
     def load_knowledge_insights(self, json_path):
         """Loads Knowledge Engine insights (schema relationships) from JSON."""
@@ -322,13 +334,22 @@ class LineageGraphTraverser:
         if depth >= max_depth:
             return {}
 
-        logger.info(f"Searching upstream column lineage for {target_entry_name} (depth {depth})...")
         column_mappings = {}
 
         for col in target_columns:
+            cache_key = (target_entry_name, col)
+            with self._lock:
+                if cache_key in self._lineage_cache:
+                    column_mappings[col] = self._lineage_cache[cache_key]
+                    continue
+
+            logger.info(f"Searching upstream column lineage for {target_entry_name}.{col} (depth {depth})...")
             try:
                 links = self._search_links(target_entry_name, [col], "target")
                 if not links:
+                    column_mappings[col] = []
+                    with self._lock:
+                        self._lineage_cache[cache_key] = []
                     continue
 
                 matches = []
@@ -363,38 +384,65 @@ class LineageGraphTraverser:
                 
                 if matches:
                     # Sort candidates by confidence
-                    column_mappings[col] = sorted(matches, key=lambda x: x['confidence'], reverse=True)
+                    sorted_matches = sorted(matches, key=lambda x: x['confidence'], reverse=True)
+                    column_mappings[col] = sorted_matches
+                    with self._lock:
+                        self._lineage_cache[cache_key] = sorted_matches
+                else:
+                    column_mappings[col] = []
+                    with self._lock:
+                        self._lineage_cache[cache_key] = []
 
             except Exception as e:
                 logger.warning(f"Failed to fetch upstream lineage for column {col}: {e}")
+                column_mappings[col] = []
         
         return column_mappings
 
+    def _resolve_single_column_lineage(self, target_entry_name, col, max_depth):
+        """Resolves lineage recursively for a single column."""
+        to_explore = [(target_entry_name, col, 0)]
+        seen_nodes = set()
+        paths = []
+        
+        while to_explore:
+            curr_ent, curr_col, depth = to_explore.pop(0)
+            if depth >= max_depth:
+                continue
+                
+            mappings = self.get_column_lineage(curr_ent, [curr_col], depth=depth, max_depth=max_depth)
+            for m in mappings.get(curr_col, []):
+                # Avoid cycles or repeat work
+                node_id = (m['source_fqn'], m['source_column'])
+                if node_id not in seen_nodes:
+                    seen_nodes.add(node_id)
+                    paths.append(m)
+                    # Add to queue for deeper exploration
+                    to_explore.append((m['source_fqn'], m['source_column'], depth + 1))
+        return col, paths
+
     def get_recursive_column_lineage(self, target_entry_name, target_columns, max_depth=3):
         """
-        Resolves lineage multi-hop (Table -> View -> View) and explores branching paths.
+        Resolves lineage multi-hop (Table -> View -> View) and explores branching paths in parallel.
         Returns a map: target_col -> list of all unique ancestor mappings found.
         """
-        final_paths = {col: [] for col in target_columns}
+        from concurrent.futures import ThreadPoolExecutor
         
-        for col in target_columns:
-            to_explore = [(target_entry_name, col, 0)]
-            seen_nodes = set()
-            
-            while to_explore:
-                curr_ent, curr_col, depth = to_explore.pop(0)
-                if depth >= max_depth:
-                    continue
+        final_paths = {}
+        logger.info(f"Searching upstream column lineage for {target_entry_name} columns {target_columns} (depth 0) in parallel...")
+        
+        with ThreadPoolExecutor(max_workers=min(len(target_columns), 10)) as executor:
+            futures = [
+                executor.submit(self._resolve_single_column_lineage, target_entry_name, col, max_depth)
+                for col in target_columns
+            ]
+            for fut in futures:
+                try:
+                    col, paths = fut.result()
+                    final_paths[col] = paths
+                except Exception as e:
+                    logger.warning(f"Failed to resolve lineage for a column: {e}")
                     
-                mappings = self.get_column_lineage(curr_ent, [curr_col], depth=depth, max_depth=max_depth)
-                for m in mappings.get(curr_col, []):
-                    # Cache unique nodes to avoid cycles or repeat work
-                    node_id = (m['source_fqn'], m['source_column'])
-                    if node_id not in seen_nodes:
-                        seen_nodes.add(node_id)
-                        final_paths[col].append(m)
-                        # Add to queue for deeper exploration
-                        to_explore.append((m['source_fqn'], m['source_column'], depth + 1))
         return final_paths
 
     def get_downstream_lineage(self, source_entry_name, source_columns):
