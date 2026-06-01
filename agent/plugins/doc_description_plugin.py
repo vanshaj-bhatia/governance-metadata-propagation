@@ -2,6 +2,7 @@ import sys
 import os
 import logging
 import pandas as pd
+import threading
 from typing import List, Dict, Any, Optional
 
 from google.adk.plugins.base_plugin import BasePlugin
@@ -21,6 +22,8 @@ class DocDescriptionPlugin(BasePlugin):
         self._bq_client = None
         self._rag_engine = None
         self._client = None
+        self._lock = threading.Lock()
+        self._thread_local = threading.local()
 
     def _ensure_initialized(self):
         creds = get_credentials(self.project_id)
@@ -196,8 +199,12 @@ class DocDescriptionPlugin(BasePlugin):
         location = "global" 
         datastore_id = self.datastore_id
         
-        credentials, project = google.auth.default()
-        authed_session = AuthorizedSession(credentials)
+        # Use thread-local storage for session to reuse connections
+        if not hasattr(self._thread_local, 'session'):
+            credentials, project = google.auth.default()
+            self._thread_local.session = AuthorizedSession(credentials)
+            
+        authed_session = self._thread_local.session
         
         # Handle full resource path vs short ID
         if datastore_id.startswith("projects/"):

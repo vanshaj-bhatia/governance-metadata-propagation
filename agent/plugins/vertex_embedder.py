@@ -1,4 +1,5 @@
 import logging
+import threading
 import numpy as np
 from typing import List, Optional, Any
 from google import genai
@@ -17,14 +18,16 @@ class VertexAIEmbedder:
         self.project_id = project_id
         self.location = location
         self.model_name = model_name
-        self._client = None
+        # Use thread-local storage to avoid concurrent mutation of SSL context in multi-threaded RAG mode
+        self._thread_local = threading.local()
         self._credentials = credentials
 
     def _get_client(self):
-        if self._client is None:
+        # Lazily initialize client per thread to ensure thread safety
+        if not hasattr(self._thread_local, 'client'):
             try:
                 # Use vertex_ai=True to ensure we use the Vertex AI backed API
-                self._client = genai.Client(
+                self._thread_local.client = genai.Client(
                     project=self.project_id,
                     location=self.location,
                     credentials=self._credentials,
@@ -32,7 +35,8 @@ class VertexAIEmbedder:
                 )
             except Exception as e:
                 logger.error(f"Failed to initialize Google Gen AI Client: {e}")
-        return self._client
+                return None
+        return self._thread_local.client
 
     def get_embeddings(self, texts: List[str], task_type: str = "RETRIEVAL_DOCUMENT") -> List[List[float]]:
         """
