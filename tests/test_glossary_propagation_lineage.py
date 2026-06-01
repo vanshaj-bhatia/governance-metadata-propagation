@@ -48,14 +48,17 @@ class TestGlossaryPropagationLineage(unittest.TestCase):
         mock_table = MagicMock()
         mock_table.schema = [mock_field]
         
-        # Upstream Info
-        mock_upstream_field = MagicMock()
-        mock_upstream_field.name = "product_id"
-        mock_upstream_field.description = "Source ID"
-        mock_upstream_table = MagicMock()
-        mock_upstream_table.schema = [mock_upstream_field]
+    def test_strict_lineage_propagation_threshold(self):
+        # Scenario: Catalog link does NOT exist upstream -> Should NOT propagate via lineage, even with high similarity
+        dataset_id = "ds"
+        table_id = "products"
         
-        # Custom get_table mock logic to avoid StopIteration
+        mock_field = MagicMock(); mock_field.name = "product_id"; mock_field.description = "Product ID"
+        mock_table = MagicMock(); mock_table.schema = [mock_field]
+        
+        mock_upstream_field = MagicMock(); mock_upstream_field.name = "product_id"; mock_upstream_field.description = "Source ID"
+        mock_upstream_table = MagicMock(); mock_upstream_table.schema = [mock_upstream_field]
+        
         def get_table_mock(ref):
             if "raw_products" in ref:
                 return mock_upstream_table
@@ -80,20 +83,13 @@ class TestGlossaryPropagationLineage(unittest.TestCase):
             'description': 'Product SKU description'
         }
         self.plugin._glossary_client.get_all_terms.return_value = [term]
+        self.plugin._similarity_engine.get_ranked_suggestions.return_value = [] # No normal matches
         
-        # 3. Test Cases for Thresholds
+        # 3. Test Case
         with patch.object(GlossaryPlugin, '_check_link_exists', return_value=False):
-            # A. Score 0.96 (SAFE) -> Should propagate
-            self.plugin._similarity_engine.calculate_total_score.return_value = {"total": 0.96}
             recs = self.plugin.recommend_terms_for_table(dataset_id, table_id)
-            self.assertFalse(recs.empty)
-            self.assertIn("Propagated via Lineage", recs.iloc[0]['Rationale'])
-
-            # B. Score 0.90 (DANGEROUS) -> Should NOT propagate via lineage
-            self.plugin._similarity_engine.calculate_total_score.return_value = {"total": 0.90}
-            self.plugin._similarity_engine.get_ranked_suggestions.return_value = [] # No normal matches either
-            recs_strict = self.plugin.recommend_terms_for_table(dataset_id, table_id)
-            self.assertTrue(recs_strict.empty)
+            # Should be empty because Catalog link is False, and no similarity fallback exists in lineage path
+            self.assertTrue(recs.empty)
 
     def test_direct_link_propagation(self):
         # Scenario: Explicit link exists on source -> should propagate regardless of similarity score

@@ -1,6 +1,6 @@
-# Governance Metadata Propagation Demo
+# Governance on Auto-pilot: Agentic Data Governance with Knowledge Catalog
 
-This project demonstrates an agentic data governance solution using Google Cloud Dataplex. It showcases how to automate metadata management - propagate descriptions, glossary terms, policy tags etc. using **column level lineage** and leveraging Dataplex **Dataset Insights** capabilities. This is only a demonstration and is not part of official product, please review everything before using it for your environments and use-cases.
+This project demonstrates an agentic data governance solution using Google Cloud Knowledge Catalog. It showcases how to automate metadata management - propagate descriptions, glossary terms, policy tags etc. using **column level lineage** and leveraging Knowledge Catalog **Dataset Insights** capabilities. This is only a demonstration and is not part of official product, please review everything before using it for your environments and use-cases.
 
 ---
 
@@ -11,10 +11,10 @@ This project demonstrates an agentic data governance solution using Google Cloud
 *   **SQL-Based Logic Enrichment**: Extracts BigQuery SQL transformations to generate human-readable descriptions for computed columns.
 *   **AI Business Glossary**: Maps technical columns to business terms using Vertex AI Semantic Similarity and **Unstructured Documents** (PDFs, TXT, MD).
 *   **Prioritized Glossary Propagation**: Automatically propagates glossary terms across tables based on lineage, with strict verification thresholds to ensure accuracy (especially for 1-1 mappings).
-*   **Native Dataplex Integration**: Persists glossary mappings as native `EntryLinks` visible in the Dataplex Schema tab.
+*   **Native Knowledge Catalog Integration**: Persists glossary mappings as native `EntryLinks` visible in the Knowledge Catalog Schema tab.
 *   **Unified UI & CLI**: Manage governance tasks via a Gradio-based web app or a headless CLI.
 *   **Policy Tag Propagation**: Recommends and applies BigQuery policy tags via lineage, with support for "straight pull" detection and an integrated **Access Summary** (Readers & Data Policies).
-*   **Data Trust Center (DQ)**: Derived trust scores for views and tables based on upstream Dataplex DQ/Profiling results and multi-hop lineage.
+*   **Data Trust Center (DQ)**: Derived trust scores for views and tables based on upstream Knowledge Catalog DQ/Profiling results and multi-hop lineage.
 *   **Unstructured Document Processing**: Leverage PDFs, TXT, and Markdown files to influence column descriptions and policy tags using Gemini and RAG.
 *   **Remediation Detection**: Automatically detects SQL transformations (e.g. `COALESCE`, `DISTINCT`) that improve data quality and applies "Trust Bonuses".
 *   **Trust History Persistence**: Tracks 0.0-1.0 trust scores over time in BigQuery for trend analysis.
@@ -114,9 +114,9 @@ python3 steward_cli.py policy-propagate --dataset retail_syn_data --table transa
 # Analyze and propagate trust/DQ scores for a view or table
 python3 steward_cli.py dq-propagate --dataset retail_syn_data --table customers
 
-# NEW: End-to-end Dataplex AI Insight propagation (Trigger -> Extract -> Apply)
-# This handles the full scan, wait, and metadata update in one go.
-python3 steward_cli.py dataplex-propagate --dataset retail_syn_data --table transactions --apply
+# NEW: End-to-end Knowledge Catalog AI Insight propagation (Trigger -> Extract -> Apply)
+# This handles the full scan, wait, and metadata update in one go. Supports legacy alias `dataplex-propagate`.
+python3 steward_cli.py knowledge-propagate --dataset retail_syn_data --table transactions --apply
 ```
 
 ## 📄 Unstructured Document Processing
@@ -152,6 +152,34 @@ When using the `--document` flag with the `apply`, `policy-propagate`, or `gloss
 
 ---
 
+## ⚙️ Glossary Cache Configuration
+
+In enterprise governance workflows, stewards often scan read-only production datasets (where they lack `bigquery.dataEditor` permissions). To optimize glossary mapping recommendations, the steward needs a cache. The system supports redirecting the business glossary embeddings cache to a dedicated writable dataset:
+
+### 1. Web UI (Gradio)
+Open the **Global Environment Settings** accordion at the top of the dashboard:
+- **Glossary Cache Dataset ID**: The dataset where you want the `glossary_embeddings_cache` table to be created (e.g., a separate sandbox or metadata dataset).
+- **Glossary Cache Table ID**: Custom table name for storing cached embeddings (defaults to `glossary_embeddings_cache`).
+
+### 2. CLI Flags
+You can pass the cache location explicitly as command line arguments to any command:
+```bash
+python3 steward_cli.py glossary-recommend \
+  --dataset prod_readonly_dataset \
+  --table transactions \
+  --cache-dataset metadata_sandbox_dataset \
+  --cache-table my_glossary_cache
+```
+
+### 3. Environment Variables
+You can also set these values in a `.env` file or in your shell:
+* `GLOSSARY_CACHE_DATASET_ID`: Redirects the cache table to a separate BigQuery dataset.
+* `GLOSSARY_CACHE_TABLE_ID`: Custom name for the BigQuery cache table.
+
+> 💡 *Note: If BigQuery cache initialization fails due to write permissions, the plugin automatically falls back to a local JSON file cache (`scratch/glossary_embeddings_cache.json`) transparently, ensuring zero disruption to the user experience.*
+
+---
+
 ## 🧩 Project Modules
 
 | Module | Location | Description |
@@ -160,7 +188,7 @@ When using the `--document` flag with the `apply`, `policy-propagate`, or `gloss
 | **Lineage Plugin** | `agent/plugins/lineage_plugin.py` | Orchestrates description propagation via Lineage API. |
 | **Policy Tag Plugin** | `agent/plugins/policy_tag_plugin.py` | Recommends and applies Policy Tags based on lineage and SQL analysis. |
 | **Similarity Engine** | `agent/plugins/similarity_engine.py` | AI logic for scoring lexical and semantic matches. |
-| **DQ Plugin** | `agent/plugins/dq_plugin.py` | Interfaces with Dataplex DQ/Profiling result jobs with BQ fallbacks. |
+| **DQ Plugin** | `agent/plugins/dq_plugin.py` | Interfaces with Knowledge Catalog DQ/Profiling result jobs with BQ fallbacks. |
 | **DQ Propagation** | `dataplex_integration/dq_propagation.py` | Recursive DQ scoring and remediation detection logic. |
 | **Traverser** | `dataplex_integration/lineage_propagation.py` | Low-level Graph API logic for traversing dependencies. |
 | **Enricher** | `dataplex_integration/lineage_propagation.py` | Context-aware SQL transformation analyzer. |
@@ -170,7 +198,7 @@ When using the `--document` flag with the `apply`, `policy-propagate`, or `gloss
 ## 💡 Workflow Example
 
 1.  **Initialize**: Generate synthetic data and lineage relationships.
-2.  **Enrich & Propagate**: Run the unified `dataplex-propagate` command to trigger AI scans and sync metadata.
-4.  **Tag**: Use the **Glossary Plugin** to map technical columns to the Business Glossary for Dataplex UI visibility.
+2.  **Enrich & Propagate**: Run the unified `knowledge-propagate` command to trigger AI scans and sync metadata.
+4.  **Tag**: Use the **Glossary Plugin** to map technical columns to the Business Glossary for Knowledge Catalog UI visibility.
 5.  **Secure**: Use the **Policy Tag Propagation** plugin to sync sensitive data tags and verify access summary (Readers/Masking Rules).
-6.  **Verify**: Check the **BigQuery Console** (Schema -> Policy Tags) and **Dataplex Schema** (Business Terms).
+6.  **Verify**: Check the **BigQuery Console** (Schema -> Policy Tags) and **Knowledge Catalog Schema** (Business Terms).

@@ -1,8 +1,15 @@
 import contextvars
-from typing import Optional
+import threading
+import logging
+import google.auth
 import google.oauth2.credentials
+from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 _oauth_token = contextvars.ContextVar("oauth_token", default=None)
+_cached_adc_creds = None
+_adc_lock = threading.Lock()
 
 def set_oauth_token(token: Optional[str]):
     """Sets the OAuth token for the current context."""
@@ -12,10 +19,10 @@ def get_oauth_token() -> Optional[str]:
     """Gets the OAuth token from the current context."""
     return _oauth_token.get()
 
-def get_credentials(quota_project_id: str) -> Optional[google.oauth2.credentials.Credentials]:
+def get_credentials(quota_project_id: str):
     """
-    Returns Google Credentials object created from the stored OAuth token.
-    IMPORTANT: quota_project_id is required for user credentials to work with certain BigQuery APIs.
+    Returns Google Credentials object created from the stored OAuth token,
+    falling back to cached Application Default Credentials (ADC) if token is None.
     """
     token = get_oauth_token()
     if token:
@@ -23,4 +30,16 @@ def get_credentials(quota_project_id: str) -> Optional[google.oauth2.credentials
             token,
             quota_project_id=quota_project_id
         )
-    return None
+        
+    global _cached_adc_creds
+    if not _cached_adc_creds:
+        with _adc_lock:
+            if not _cached_adc_creds:
+                logger.info("Pre-loading system Application Default Credentials (ADC) to avoid concurrent thread forks...")
+                try:
+                    _cached_adc_creds, _ = google.auth.default()
+                except Exception as e:
+                    logger.error(f"Failed to load Application Default Credentials: {e}")
+                    _cached_adc_creds = None
+                    
+    return _cached_adc_creds
